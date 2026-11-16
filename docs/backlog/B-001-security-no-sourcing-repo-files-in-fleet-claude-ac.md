@@ -2,10 +2,11 @@
 id: B-001
 title: "security: no sourcing repo files in fleet/claude-acct, safe state files, gate from main, narrow fleet allowlist"
 type: bug
-status: todo
+status: doing
 milestone: "v0.2"
 deps: []
 created: 2026-11-16
+owner: sec
 ---
 
 

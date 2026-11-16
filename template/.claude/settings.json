@@ -14,7 +14,9 @@
       "Bash(herdr agent read *)",
       "Bash(herdr pane list *)",
       "Bash(herdr tab list *)",
-      "Bash(fleet *)",
+      "Bash(fleet status)",
+      "Bash(fleet read *)",
+      "Bash(fleet wait *)",
       "Bash(backlog *)"
     ],
     "deny": [

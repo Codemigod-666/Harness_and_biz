@@ -10,6 +10,43 @@ set -euo pipefail
 die() { echo "claude-acct: $*" >&2; exit 1; }
 A_DIR="$HOME/.claude"
 
+# ---- accounts.env: shared verbatim by fleet and claude-acct (tests/security.sh checks the copies match) ----
+# The file is repo-controlled, so it is read as data, never sourced. Only ACCOUNT_B_DIR and SHARED_ITEMS are
+# read; a leading $HOME, ${HOME} or ~ is expanded here and any other shell syntax is refused.
+read_accounts_env() { # <file> <project root>: sets ACCOUNT_B_DIR and SHARED_ITEMS when the file has them
+    local line key val rest from_file=0 item home lex real root
+    local kv='^[[:space:]]*(export[[:space:]]+)?(ACCOUNT_B_DIR|SHARED_ITEMS)=(.*)$'
+    local dq='^"([^"]*)"[[:space:]]*(#.*)?$' sq="^'([^']*)'[[:space:]]*(#.*)?\$"
+    local bare='^([^"'"'"'[:space:]#]*)[[:space:]]*(#.*)?$'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ $kv ]] || continue
+        key="${BASH_REMATCH[2]}" val="${BASH_REMATCH[3]}"
+        [[ "$val" =~ $dq || "$val" =~ $sq || "$val" =~ $bare ]] || die "$1: write $key=\"value\""
+        rest="${BASH_REMATCH[1]}" val=""
+        case "$rest" in
+        '$HOME' | '${HOME}' | '~') val="$HOME" rest="" ;;
+        '$HOME/'* | '${HOME}/'* | '~/'*) val="$HOME" rest="/${rest#*/}" ;;
+        esac
+        [[ "$rest" != *[\$\`\\]* && "$rest" != *[[:cntrl:]]* ]] ||
+            die "$1: $key: only a leading \$HOME or ~ is expanded (no other \$, \` or \\)"
+        printf -v "$key" '%s' "$val$rest"
+        [[ "$key" != ACCOUNT_B_DIR ]] || from_file=1
+    done <"$1"
+    if [[ $from_file == 1 ]]; then
+        home="$(realpath -ms "$HOME")" lex="$(realpath -ms "$ACCOUNT_B_DIR")"
+        real="$(realpath -m "$ACCOUNT_B_DIR")" root="$(realpath -m "$2")"
+        [[ "$ACCOUNT_B_DIR" == /* && "$lex" == "$home"/?* ]] || die "$1: ACCOUNT_B_DIR ($ACCOUNT_B_DIR) must be under \$HOME"
+        [[ "$lex" != "$home/.claude" ]] || die "$1: ACCOUNT_B_DIR must not be account A's ~/.claude"
+        [[ "$real" != "$root" && "$real" != "$root"/* ]] || die "$1: ACCOUNT_B_DIR must not be inside the project"
+    fi
+    local -a items=()
+    read -ra items <<<"${SHARED_ITEMS:-}"
+    for item in "${items[@]}"; do
+        [[ "$item" =~ ^[A-Za-z0-9._-]+$ && "$item" != . && "$item" != .. ]] ||
+            die "$1: SHARED_ITEMS entry '$item' must be a plain name ([A-Za-z0-9._-], not . or ..)"
+    done
+}
+
 find_root() {
     local d="$PWD"
     while [[ "$d" != / ]]; do
@@ -23,8 +60,7 @@ load_config() {
     ROOT="$(find_root)" || die "no .claude/accounts.env above $PWD: run claude-acct init in the project"
     ACCOUNT_B_DIR="$HOME/.claude-b"
     SHARED_ITEMS="settings.json settings.local.json skills hooks plugins CLAUDE.md"
-    # shellcheck disable=SC1091
-    source "$ROOT/.claude/accounts.env"
+    read_accounts_env "$ROOT/.claude/accounts.env" "$ROOT"
     SLUG="$(sed 's#[^A-Za-z0-9]#-#g' <<<"$ROOT")" # Claude Code's folder name for this project
 }
 
@@ -46,8 +82,9 @@ EOF
 cmd_setup() {
     mkdir -p "$ACCOUNT_B_DIR"
     chmod 700 "$ACCOUNT_B_DIR"
-    local item
-    for item in $SHARED_ITEMS; do
+    local item items
+    read -ra items <<<"$SHARED_ITEMS"
+    for item in "${items[@]}"; do
         [[ -e "$A_DIR/$item" ]] || continue
         if [[ -e "$ACCOUNT_B_DIR/$item" && ! -L "$ACCOUNT_B_DIR/$item" ]]; then
             echo "skip $item: B has its own copy (remove it to share A's)"

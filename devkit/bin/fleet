@@ -3,6 +3,7 @@
 # auto mode, in its own git worktree and branch (fleet/<name>), with its own test port. Wraps the herdr CLI;
 # needs herdr (inside a herdr pane), git, python3. Scratch state lives in <main repo>/.claude/fleet/ (gitignored).
 set -euo pipefail
+die() { echo "fleet: $*" >&2; exit 1; }
 
 COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
     echo "fleet: run inside the project's git repo" >&2
@@ -26,8 +27,46 @@ readonly PLUGIN_ROOT="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 # Accounts: a = default config (~/.claude, CLAUDE_CONFIG_DIR unset); b = a second subscription in its own config
 # dir. Override per project with ACCOUNT_B_DIR in <main repo>/.claude/accounts.env, or FLEET_ACCOUNT_B_DIR.
 ACCOUNT_B_DIR="${FLEET_ACCOUNT_B_DIR:-$HOME/.claude-b}"
-# shellcheck disable=SC1091
-[[ -f "$MAIN/.claude/accounts.env" ]] && source "$MAIN/.claude/accounts.env"
+SHARED_ITEMS="" # claude-acct's; read here only so both scripts share one parser
+
+# ---- accounts.env: shared verbatim by fleet and claude-acct (tests/security.sh checks the copies match) ----
+# The file is repo-controlled, so it is read as data, never sourced. Only ACCOUNT_B_DIR and SHARED_ITEMS are
+# read; a leading $HOME, ${HOME} or ~ is expanded here and any other shell syntax is refused.
+read_accounts_env() { # <file> <project root>: sets ACCOUNT_B_DIR and SHARED_ITEMS when the file has them
+    local line key val rest from_file=0 item home lex real root
+    local kv='^[[:space:]]*(export[[:space:]]+)?(ACCOUNT_B_DIR|SHARED_ITEMS)=(.*)$'
+    local dq='^"([^"]*)"[[:space:]]*(#.*)?$' sq="^'([^']*)'[[:space:]]*(#.*)?\$"
+    local bare='^([^"'"'"'[:space:]#]*)[[:space:]]*(#.*)?$'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ $kv ]] || continue
+        key="${BASH_REMATCH[2]}" val="${BASH_REMATCH[3]}"
+        [[ "$val" =~ $dq || "$val" =~ $sq || "$val" =~ $bare ]] || die "$1: write $key=\"value\""
+        rest="${BASH_REMATCH[1]}" val=""
+        case "$rest" in
+        '$HOME' | '${HOME}' | '~') val="$HOME" rest="" ;;
+        '$HOME/'* | '${HOME}/'* | '~/'*) val="$HOME" rest="/${rest#*/}" ;;
+        esac
+        [[ "$rest" != *[\$\`\\]* && "$rest" != *[[:cntrl:]]* ]] ||
+            die "$1: $key: only a leading \$HOME or ~ is expanded (no other \$, \` or \\)"
+        printf -v "$key" '%s' "$val$rest"
+        [[ "$key" != ACCOUNT_B_DIR ]] || from_file=1
+    done <"$1"
+    if [[ $from_file == 1 ]]; then
+        home="$(realpath -ms "$HOME")" lex="$(realpath -ms "$ACCOUNT_B_DIR")"
+        real="$(realpath -m "$ACCOUNT_B_DIR")" root="$(realpath -m "$2")"
+        [[ "$ACCOUNT_B_DIR" == /* && "$lex" == "$home"/?* ]] || die "$1: ACCOUNT_B_DIR ($ACCOUNT_B_DIR) must be under \$HOME"
+        [[ "$lex" != "$home/.claude" ]] || die "$1: ACCOUNT_B_DIR must not be account A's ~/.claude"
+        [[ "$real" != "$root" && "$real" != "$root"/* ]] || die "$1: ACCOUNT_B_DIR must not be inside the project"
+    fi
+    local -a items=()
+    read -ra items <<<"${SHARED_ITEMS:-}"
+    for item in "${items[@]}"; do
+        [[ "$item" =~ ^[A-Za-z0-9._-]+$ && "$item" != . && "$item" != .. ]] ||
+            die "$1: SHARED_ITEMS entry '$item' must be a plain name ([A-Za-z0-9._-], not . or ..)"
+    done
+}
+
+[[ ! -f "$MAIN/.claude/accounts.env" ]] || read_accounts_env "$MAIN/.claude/accounts.env" "$MAIN"
 readonly ACCOUNT_B_DIR
 
 usage() {
@@ -50,13 +89,16 @@ fleet: supervisor/worker agents on herdr (every worker = its own Claude Code pro
   respawn <name> [-m <model>] [-e lvl] [-a a|b]
                                         handover, exit, restart the same worktree on another model/account, resume
   accounts                              login state of accounts a and b and how many agents each runs
-  land <name> [--no-gate]               run `devkit gate` in the worktree, fast-forward main to fleet/<name>
+  land <name> [--no-gate] [--allow-gate-change]
+                                        run main's committed DEVKIT_GATE in the worktree, fast-forward main to
+                                        fleet/<name>; refuses a branch that changes the gate's files. Both flags
+                                        need a person at a terminal (typed confirmation)
+Workers (FLEET_AGENT set, not supervisor) may only run status, read, wait, accounts, init, notify.
   close <name>                          exit the agent, close its tab, remove the worktree if clean and merged
   notify <title> [body]                 herdr notification to the user
 EOF
 }
 
-die() { echo "fleet: $*" >&2; exit 1; }
 # json <dotted.path>: read one value from JSON on stdin ("" when missing).
 json() { python3 -c 'import json,sys
 v=json.load(sys.stdin)
@@ -68,12 +110,47 @@ require_herdr() {
     [[ "${HERDR_ENV:-}" == 1 ]] || die "not inside a herdr pane (HERDR_ENV != 1); start herdr first"
 }
 
+require_supervisor() { # <subcommand>: workers can't drive the fleet (their tab sets FLEET_AGENT=<name>)
+    [[ -z "${FLEET_AGENT:-}" || "$FLEET_AGENT" == supervisor ]] ||
+        die "$1 is for the supervisor; you are worker '$FLEET_AGENT' (ask the supervisor)"
+}
+
+check_name() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,14}$ ]] || die "name must match [a-z][a-z0-9-]{0,14}"; }
+check_model() { [[ "$1" =~ ^(sonnet|opus|haiku|claude-[a-z0-9.-]+)$ ]] || die "model must be sonnet, opus, haiku or claude-<id>"; }
+check_effort() { [[ "$1" =~ ^(low|medium|high|xhigh|max)?$ ]] || die "effort must be low, medium, high, xhigh or max"; }
+check_lane() { [[ "$1" != *[[:cntrl:]]* ]] || die "lane must be one line of text"; }
+
 agent_id() { echo "$PROJECT-$1" | cut -c1-32; }
 state_file() { echo "$AGENTS_DIR/$1.env"; }
+# Agent state files: KEY=value lines, every value written with printf %q. They are read back as data, never
+# sourced (.claude/fleet could arrive in a cloned repo). Files from older fleet versions (LANE="…") still load.
+readonly STATE_KEYS=(NAME ID TAB PANE SPLIT CWD BRANCH PORT MODEL EFFORT ACCOUNT LANE)
+write_state() { # from the globals NAME … LANE
+    local f k
+    f="$(state_file "$NAME")"
+    for k in "${STATE_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k-}"; done >"$f.tmp"
+    mv "$f.tmp" "$f"
+}
+load_state() { # <file>: sets the globals NAME … LANE (missing keys empty)
+    local line key val out
+    for key in "${STATE_KEYS[@]}"; do printf -v "$key" '%s' ""; done
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([A-Z]+)=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+        [[ " ${STATE_KEYS[*]} " == *" $key "* ]] || continue
+        case "$val" in
+        "''") out="" ;;
+        \$\'*\') printf -v out '%b' "${val:2:${#val}-3}"; out="${out//\\\'/\'}" ;; # %q of non-ASCII in a C locale
+        \"*\") out="${val:1:${#val}-2}" ;;                                       # older files: LANE="…"
+        *) IFS= read out <<<"$val" ;; # read without -r drops %q's backslashes; nothing is expanded
+        esac
+        printf -v "$key" '%s' "$out"
+    done <"$1"
+}
 load() {
+    check_name "$1"
     [[ -f "$(state_file "$1")" ]] || die "no fleet agent '$1' (fleet status)"
-    # shellcheck disable=SC1090
-    source "$(state_file "$1")"
+    load_state "$(state_file "$1")"
 }
 
 cmd_init() {
@@ -160,7 +237,7 @@ cmd_spawn() {
     require_herdr
     local name="$1" model=sonnet effort="" lane="" here=0 split=0 account=""
     shift
-    [[ "$name" =~ ^[a-z][a-z0-9-]{0,14}$ ]] || die "name must match [a-z][a-z0-9-]{0,14}"
+    check_name "$name"
     [[ ! -f "$(state_file "$name")" ]] || die "$name exists (fleet status / fleet close $name)"
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -173,6 +250,9 @@ cmd_spawn() {
         *) die "unknown option $1" ;;
         esac
     done
+    check_model "$model"
+    check_effort "$effort"
+    check_lane "$lane"
     cmd_init >/dev/null
     [[ -n "$account" ]] || account="$(pick_account)"
     check_account "$account"
@@ -185,8 +265,8 @@ cmd_spawn() {
         # first split worker goes right of the caller; the next ones stack below the newest split worker
         local target="$HERDR_PANE_ID" direction=right f
         while IFS= read -r f; do
-            if grep -q '^SPLIT=1$' "$f"; then
-                target="$(sed -n 's/^PANE=//p' "$f")"; direction=down; break
+            if [[ "$(load_state "$f"; echo "$SPLIT")" == 1 ]]; then
+                target="$(load_state "$f"; echo "$PANE")"; direction=down; break
             fi
         done < <(ls -t "$AGENTS_DIR"/*.env 2>/dev/null)
         created="$(herdr pane split --pane "$target" --direction "$direction" --cwd "$cwd" --no-focus "${envs[@]}")"
@@ -200,41 +280,24 @@ cmd_spawn() {
     sleep 1 # let the shell reach its prompt
     set_pane_account "$pane" "$account"
     start_claude "$id" "$pane" "$model" "$effort"
-    cat >"$(state_file "$name")" <<EOF
-NAME=$name
-ID=$id
-TAB=$tab
-PANE=$pane
-SPLIT=$split
-CWD=$(printf %q "$cwd")
-BRANCH=$([[ $here == 1 ]] && echo "" || echo "fleet/$name")
-PORT=$port
-MODEL=$model
-EFFORT=$effort
-ACCOUNT=$account
-LANE="$lane"
-EOF
+    NAME="$name" ID="$id" TAB="$tab" PANE="$pane" SPLIT="$split" CWD="$cwd" PORT="$port"
+    BRANCH="fleet/$name" MODEL="$model" EFFORT="$effort" ACCOUNT="$account" LANE="$lane"
+    [[ $here == 0 ]] || BRANCH=""
+    write_state
     echo "$name: $id in $tab ($pane), $model, account $account, cwd $cwd, port $port"
 }
 
 cmd_adopt() { # register the calling pane's agent (the supervisor) so reset/status work on it
     require_herdr
     local name="${1:-supervisor}"
+    check_name "$name"
+    check_model "${FLEET_MODEL:-opus}"
     cmd_init >/dev/null
     herdr agent rename "$HERDR_PANE_ID" "$(agent_id "$name")" >/dev/null
-    cat >"$(state_file "$name")" <<EOF
-NAME=$name
-ID=$(agent_id "$name")
-TAB=$HERDR_TAB_ID
-PANE=$HERDR_PANE_ID
-CWD=$(printf %q "$MAIN")
-BRANCH=
-PORT=$PORT_BASE
-MODEL=${FLEET_MODEL:-opus}
-EFFORT=
-ACCOUNT=$(current_account)
-LANE="supervisor: backlog, docs/decisions.md, board"
-EOF
+    NAME="$name" ID="$(agent_id "$name")" TAB="$HERDR_TAB_ID" PANE="$HERDR_PANE_ID" SPLIT=0 CWD="$MAIN" BRANCH=""
+    PORT="$PORT_BASE" MODEL="${FLEET_MODEL:-opus}" EFFORT="" ACCOUNT="$(current_account)"
+    LANE="supervisor: backlog, docs/decisions.md, board"
+    write_state
     echo "$name: adopted $HERDR_PANE_ID as $(agent_id "$name")"
 }
 
@@ -279,8 +342,7 @@ cmd_status() {
     for f in "$AGENTS_DIR"/*.env; do
         [[ -f "$f" ]] || continue
         (
-            # shellcheck disable=SC1090
-            source "$f"
+            load_state "$f"
             local state tokens
             state="$(PANE="$PANE" python3 -c 'import json,os,sys
 agents=json.load(sys.stdin).get("result",{}).get("agents",[])
@@ -338,28 +400,87 @@ cmd_respawn() {
         *) die "unknown option $1" ;;
         esac
     done
+    check_model "$MODEL"
+    check_effort "$EFFORT"
     check_account "$ACCOUNT"
     ensure_handover
     herdr agent prompt "$ID" "/exit" >/dev/null
     sleep 3
     set_pane_account "$PANE" "$ACCOUNT"
     start_claude "$ID" "$PANE" "$MODEL" "$EFFORT"
-    local f
-    f="$(state_file "$NAME")"
-    grep -q '^ACCOUNT=' "$f" || echo "ACCOUNT=" >>"$f"
-    sed -i -E "s/^MODEL=.*/MODEL=$MODEL/; s/^EFFORT=.*/EFFORT=$EFFORT/; s/^ACCOUNT=.*/ACCOUNT=$ACCOUNT/" "$f"
+    write_state
     herdr agent prompt "$ID" "$(resume_text)" >/dev/null
     echo "$NAME: respawned on $MODEL, account $ACCOUNT, and resumed"
 }
 
+require_human() { # <flag> <name>: only a person at a terminal may skip or weaken the gate, never an agent's shell
+    [[ -t 0 && -t 1 ]] || die "$1 needs a person at an interactive terminal; an agent can't pass it"
+    local answer
+    read -r -p "fleet: land $2 with $1? type '$2' to confirm: " answer
+    [[ "$answer" == "$2" ]] || die "$1 not confirmed"
+}
+
+main_cfg() { # <KEY>: its value in main's committed .devkit/config.env, read as data the way devkit reads config
+    local cfg line val=""
+    cfg="$(git -C "$MAIN" show "refs/heads/$MAIN_BRANCH:.devkit/config.env" 2>/dev/null)" || return 0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^$1=(.*)$ ]] || continue
+        val="${BASH_REMATCH[1]}"
+        [[ "$val" =~ ^\"(.*)\"$ ]] && val="${BASH_REMATCH[1]}"
+    done <<<"$cfg"
+    printf '%s' "$val"
+}
+
+gate_changes() { # <sha>: files the commit changes against main that decide what the gate runs
+    local p e
+    local -a extra=()
+    read -ra extra <<<"$(main_cfg DEVKIT_GATE_FILES)" # paths, directories or globs, space-separated
+    while IFS= read -r p; do
+        case "$p" in
+        .devkit/config.env | justfile | Justfile | .justfile | Makefile | makefile | GNUmakefile) echo "$p"; continue ;;
+        esac
+        for e in "${extra[@]}"; do
+            e="${e%/}"
+            # shellcheck disable=SC2053 # $e is a glob on purpose
+            if [[ "$p" == $e || "$p" == "$e"/* ]]; then echo "$p"; break; fi
+        done
+    done < <(git -C "$MAIN" diff --name-only --no-renames "refs/heads/$MAIN_BRANCH" "$1")
+}
+
 cmd_land() {
     load "$1"
+    shift
+    local no_gate=0 allow=0 sha gate changed
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --no-gate) no_gate=1; shift ;;
+        --allow-gate-change) allow=1; shift ;;
+        *) die "unknown option $1" ;;
+        esac
+    done
+    [[ $no_gate == 0 ]] || require_human --no-gate "$NAME"
+    [[ $allow == 0 ]] || require_human --allow-gate-change "$NAME"
     [[ -n "$BRANCH" ]] || die "$NAME works in the main tree; nothing to land"
     [[ -z "$(git -C "$CWD" status --porcelain)" ]] || die "$NAME has uncommitted changes in $CWD"
-    if [[ "${2:-}" != --no-gate ]]; then (cd "$CWD" && "$PLUGIN_ROOT/bin/devkit" gate) || die "gate failed in $CWD"; fi
     [[ "$(git -C "$MAIN" rev-parse --abbrev-ref HEAD)" == "$MAIN_BRANCH" ]] || die "$MAIN is not on $MAIN_BRANCH"
-    git -C "$MAIN" merge --ff-only "$BRANCH" || die "not a fast-forward: ask $NAME to rebase on main"
-    echo "$NAME: main now at $(git -C "$MAIN" rev-parse --short HEAD)"
+    # refs/heads/ throughout: a tag named like the branch must not stand in for it
+    sha="$(git -C "$MAIN" rev-parse --verify -q "refs/heads/$BRANCH^{commit}")" || die "no branch $BRANCH"
+    [[ "$(git -C "$CWD" rev-parse HEAD)" == "$sha" ]] || die "$CWD is not at the tip of $BRANCH"
+    git -C "$MAIN" merge-base --is-ancestor "refs/heads/$MAIN_BRANCH" "$sha" ||
+        die "not a fast-forward: ask $NAME to rebase on $MAIN_BRANCH"
+    changed="$(gate_changes "$sha")"
+    if [[ -n "$changed" && $allow == 0 ]]; then
+        die "$BRANCH changes what the gate runs: $(tr '\n' ' ' <<<"$changed")
+  review the diff; a person can then land it with --allow-gate-change"
+    fi
+    if [[ $no_gate == 0 ]]; then
+        gate="$(main_cfg DEVKIT_GATE)"
+        [[ -n "$gate" ]] || die "no DEVKIT_GATE in $MAIN_BRANCH's committed .devkit/config.env: commit one on $MAIN_BRANCH first"
+        echo "fleet: gate from $MAIN_BRANCH ($gate) in $CWD"
+        (cd "$CWD" && bash -c "$gate") || die "gate failed in $CWD"
+    fi
+    git -C "$MAIN" merge --ff-only "$sha" || die "not a fast-forward: ask $NAME to rebase on $MAIN_BRANCH"
+    echo "$NAME: $MAIN_BRANCH now at $(git -C "$MAIN" rev-parse --short HEAD)"
 }
 
 cmd_close() {
@@ -373,7 +494,7 @@ cmd_close() {
         herdr tab close "$TAB" >/dev/null 2>&1 || true
     fi
     if [[ -n "$BRANCH" ]]; then
-        if [[ -z "$(git -C "$CWD" status --porcelain)" ]] && git -C "$MAIN" merge-base --is-ancestor "$BRANCH" "$MAIN_BRANCH"; then
+        if [[ -z "$(git -C "$CWD" status --porcelain)" ]] && git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" "refs/heads/$MAIN_BRANCH"; then
             git -C "$MAIN" worktree remove "$CWD" && git -C "$MAIN" branch -d "$BRANCH" >/dev/null
         else
             echo "fleet: kept $CWD (uncommitted or unmerged work on $BRANCH)" >&2
@@ -386,6 +507,9 @@ cmd_close() {
 main() {
     local cmd="${1:-help}"
     shift || true
+    case "$cmd" in
+    adopt | spawn | brief | say | reset | respawn | land | close) require_supervisor "$cmd" ;;
+    esac
     case "$cmd" in
     init) cmd_init ;;
     adopt) cmd_adopt "$@" ;;

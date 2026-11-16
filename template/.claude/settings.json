@@ -24,6 +24,8 @@
       "Bash(git add -A*)",
       "Bash(git add .)",
       "Bash(herdr server stop*)",
+      "Bash(fleet land * --no-gate*)",
+      "Bash(fleet land * --allow-gate-change*)",
       "Read(.env)"
     ]
   },

@@ -54,8 +54,9 @@ read_accounts_env() { # <file> <project root>: sets ACCOUNT_B_DIR and SHARED_ITE
     if [[ $from_file == 1 ]]; then
         home="$(realpath -ms "$HOME")" lex="$(realpath -ms "$ACCOUNT_B_DIR")"
         real="$(realpath -m "$ACCOUNT_B_DIR")" root="$(realpath -m "$2")"
-        [[ "$ACCOUNT_B_DIR" == /* && "$lex" == "$home"/?* ]] || die "$1: ACCOUNT_B_DIR ($ACCOUNT_B_DIR) must be under \$HOME"
-        [[ "$lex" != "$home/.claude" ]] || die "$1: ACCOUNT_B_DIR must not be account A's ~/.claude"
+        # a fixed shape, so a repo can't point B at a config dir it ships (hooks, settings) elsewhere under $HOME
+        [[ "$ACCOUNT_B_DIR" == /* && "$lex" =~ ^"$home"/\.claude-[A-Za-z0-9._-]+$ ]] ||
+            die "$1: ACCOUNT_B_DIR ($ACCOUNT_B_DIR) must be \$HOME/.claude-<name>"
         [[ "$real" != "$root" && "$real" != "$root"/* ]] || die "$1: ACCOUNT_B_DIR must not be inside the project"
     fi
     local -a items=()
@@ -413,11 +414,13 @@ cmd_respawn() {
     echo "$NAME: respawned on $MODEL, account $ACCOUNT, and resumed"
 }
 
-require_human() { # <flag> <name>: only a person at a terminal may skip or weaken the gate, never an agent's shell
-    [[ -t 0 && -t 1 ]] || die "$1 needs a person at an interactive terminal; an agent can't pass it"
-    local answer
-    read -r -p "fleet: land $2 with $1? type '$2' to confirm: " answer
-    [[ "$answer" == "$2" ]] || die "$1 not confirmed"
+require_human() { # <flag> <name>: a speed bump for agents, not proof of a person. A terminal is required and a
+    # fresh code must be typed back, so piping an answer in fails; a pty driven by a program can still pass it.
+    [[ -t 0 && -t 1 ]] || die "$1 needs a person at an interactive terminal"
+    local answer code
+    code="$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+    read -r -p "fleet: land $2 with $1? type the code $code to confirm: " answer
+    [[ "$answer" == "$code" ]] || die "$1 not confirmed"
 }
 
 main_cfg() { # <KEY>: its value in main's committed .devkit/config.env, read as data the way devkit reads config
@@ -478,6 +481,9 @@ cmd_land() {
         [[ -n "$gate" ]] || die "no DEVKIT_GATE in $MAIN_BRANCH's committed .devkit/config.env: commit one on $MAIN_BRANCH first"
         echo "fleet: gate from $MAIN_BRANCH ($gate) in $CWD"
         (cd "$CWD" && bash -c "$gate") || die "gate failed in $CWD"
+        # the worker may still be running: what was gated must still be what lands
+        [[ -z "$(git -C "$CWD" status --porcelain)" && "$(git -C "$CWD" rev-parse HEAD)" == "$sha" ]] ||
+            die "$CWD changed while the gate ran; land again once $NAME is idle"
     fi
     git -C "$MAIN" merge --ff-only "$sha" || die "not a fast-forward: ask $NAME to rebase on $MAIN_BRANCH"
     echo "$NAME: $MAIN_BRANCH now at $(git -C "$MAIN" rev-parse --short HEAD)"

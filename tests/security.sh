@@ -72,11 +72,12 @@ assert_has "$(fleet accounts)" "$HOME/.claude-b" "fleet expands \$HOME in ACCOUN
 run claude-acct setup
 assert_has "$OUT" "linked skills" "claude-acct setup links shared items"
 assert_eq "$(readlink "$HOME/.claude-b/settings.json")" "$HOME/.claude/settings.json" "settings.json linked to A"
-printf 'ACCOUNT_B_DIR=~/b2  # tilde\n' >"$ACC"
-assert_has "$(fleet accounts)" "$HOME/b2" "~ expanded"
-printf "ACCOUNT_B_DIR='\${HOME}/b3'\n" >"$ACC"
-assert_has "$(fleet accounts)" "$HOME/b3" "\${HOME} expanded, single quotes"
-for bad_dir in /etc/claude-b '$HOME/../x' '$HOME' '~/.claude' "$R/.claude/b" relative/b; do
+printf 'ACCOUNT_B_DIR=~/.claude-b2  # tilde\n' >"$ACC"
+assert_has "$(fleet accounts)" "$HOME/.claude-b2" "~ expanded"
+printf "ACCOUNT_B_DIR='\${HOME}/.claude-b3'\n" >"$ACC"
+assert_has "$(fleet accounts)" "$HOME/.claude-b3" "\${HOME} expanded, single quotes"
+for bad_dir in /etc/claude-b '$HOME/../x' '$HOME' '~/.claude' '~/.claude/b' '~/.claude-b/x' '~/.claude-b/..' \
+    '~/dev/other-repo/.claude-b' '~/.config/claude' "$R/.claude-b" relative/b; do
     printf 'ACCOUNT_B_DIR="%s"\n' "$bad_dir" >"$ACC"
     refused "ACCOUNT_B_DIR=$bad_dir (fleet)" "ACCOUNT_B_DIR" fleet accounts
     refused "ACCOUNT_B_DIR=$bad_dir (claude-acct)" "ACCOUNT_B_DIR" claude-acct setup
@@ -210,6 +211,13 @@ start="$(main_at)"
 on_branch feature2 sh -c 'echo b >b.txt'
 refused "failing gate from main" "gate failed" fleet land lw
 assert_eq "$(main_at)" "$start" "main unchanged when the gate fails"
+printf 'DEVKIT_GATE="echo stray >stray.txt"\n' >"$R/.devkit/config.env"
+git -C "$R" commit -qam "gate that dirties the worktree"
+start="$(main_at)"
+on_branch feature2b sh -c 'echo b2 >b2.txt'
+refused "worktree changed while the gate ran" "changed while the gate ran" fleet land lw
+assert_eq "$(main_at)" "$start" "main unchanged when the worktree moved"
+rm -f "$W/stray.txt"
 git -C "$R" rm -q .devkit/config.env && git -C "$R" commit -qm "no config"
 on_branch feature3 sh -c 'echo c >c.txt'
 refused "main without a committed gate" "no DEVKIT_GATE" fleet land lw
@@ -225,14 +233,43 @@ if script -qec true /dev/null >/dev/null 2>&1; then # a person at a terminal (ut
     on_branch justfile2 sh -c 'printf "gate:\n\techo new\n" >justfile'
     run script -qec "fleet land lw --allow-gate-change" /dev/null <<<"nope"
     assert_has "$OUT" "not confirmed" "wrong confirmation refused"
+    run script -qec "fleet land lw --allow-gate-change" /dev/null <<<"lw"
+    assert_has "$OUT" "not confirmed" "piping the worker's name in is refused (a fresh code is asked)"
     start="$(main_at)"
     : >"$GATE_LOG"
-    run script -qec "fleet land lw --allow-gate-change" /dev/null <<<"lw"
-    assert_eq "$(main_at)" "$(git -C "$W" rev-parse HEAD)" "a person can land a gate change"
+    # a person reads the code and types it back (driven here through a pty)
+    run python3 -c '
+import os, pty, re, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[1], sys.argv[1:])
+out = b""
+while b"to confirm: " not in out:
+    out += os.read(fd, 1024)
+os.write(fd, re.search(rb"code ([0-9a-f]{6})", out).group(1) + b"\n")
+while True:
+    try:
+        d = os.read(fd, 1024)
+    except OSError:
+        break
+    if not d:
+        break
+    out += d
+sys.stdout.write(out.decode(errors="replace"))
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))' fleet land lw --allow-gate-change
+    assert_eq "$(main_at)" "$(git -C "$W" rev-parse HEAD)" "typing the shown code lands a gate change"
     assert_eq "$(cat "$GATE_LOG")" "main" "the gate still ran (main's command)"
 else
     echo "  skip interactive confirmation (no util-linux script)"
 fi
 fleet close lw >/dev/null
+
+echo "== template allowlist"
+perms="$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1]))["permissions"]; print("\n".join(p["allow"]+["DENY "+d for d in p["deny"]]))' "$ROOT/template/.claude/settings.json")"
+assert_eq "$(grep -c '^Bash(fleet' <<<"$perms")" "3" "only three fleet calls allowed"
+for a in "Bash(fleet status)" "Bash(fleet read *)" "Bash(fleet wait *)" "Bash(backlog *)" \
+    "DENY Bash(fleet land * --no-gate*)" "DENY Bash(fleet land * --allow-gate-change*)"; do
+    assert_eq "$(grep -cxF "$a" <<<"$perms")" "1" "template: $a"
+done
 no_pwn "whole run"
 finish

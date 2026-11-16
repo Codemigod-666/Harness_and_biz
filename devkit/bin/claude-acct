@@ -35,8 +35,9 @@ read_accounts_env() { # <file> <project root>: sets ACCOUNT_B_DIR and SHARED_ITE
     if [[ $from_file == 1 ]]; then
         home="$(realpath -ms "$HOME")" lex="$(realpath -ms "$ACCOUNT_B_DIR")"
         real="$(realpath -m "$ACCOUNT_B_DIR")" root="$(realpath -m "$2")"
-        [[ "$ACCOUNT_B_DIR" == /* && "$lex" == "$home"/?* ]] || die "$1: ACCOUNT_B_DIR ($ACCOUNT_B_DIR) must be under \$HOME"
-        [[ "$lex" != "$home/.claude" ]] || die "$1: ACCOUNT_B_DIR must not be account A's ~/.claude"
+        # a fixed shape, so a repo can't point B at a config dir it ships (hooks, settings) elsewhere under $HOME
+        [[ "$ACCOUNT_B_DIR" == /* && "$lex" =~ ^"$home"/\.claude-[A-Za-z0-9._-]+$ ]] ||
+            die "$1: ACCOUNT_B_DIR ($ACCOUNT_B_DIR) must be \$HOME/.claude-<name>"
         [[ "$real" != "$root" && "$real" != "$root"/* ]] || die "$1: ACCOUNT_B_DIR must not be inside the project"
     fi
     local -a items=()

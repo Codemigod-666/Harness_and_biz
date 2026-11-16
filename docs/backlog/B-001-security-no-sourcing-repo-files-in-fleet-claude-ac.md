@@ -2,7 +2,7 @@
 id: B-001
 title: "security: no sourcing repo files in fleet/claude-acct, safe state files, gate from main, narrow fleet allowlist"
 type: bug
-status: doing
+status: done
 milestone: "v0.2"
 deps: []
 created: 2026-11-16
@@ -32,3 +32,5 @@ code or weaken the gate that guards landing.
 - `template/.claude/settings.json` allowlists only read-only fleet calls (`fleet status`, `fleet read *`,
   `fleet wait *`) instead of `Bash(fleet *)`; backlog stays.
 - tests cover each point; `devkit gate` green.
+
+**Fix (sec, 6bfbce3 16f6a1c eeaaf09).** accounts.env and fleet state read as data, state validated + %q, land gates on main committed config and refuses gate-file changes (human-only overrides with one-time code), workers cannot drive fleet, template allowlist read-only. Supervisor verified: own payload test, live configs, security.sh, gate.

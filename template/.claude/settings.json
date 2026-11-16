@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(just check)",
+      "Bash(just test)",
+      "Bash(just e2e)",
+      "Bash(just gate)",
+      "Bash(just restart)",
+      "Bash(just reseed)",
+      "Bash(just logs)",
+      "Bash(herdr agent list)",
+      "Bash(herdr agent get *)",
+      "Bash(herdr agent read *)",
+      "Bash(herdr pane list *)",
+      "Bash(herdr tab list *)",
+      "Bash(fleet *)",
+      "Bash(backlog *)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git add -A*)",
+      "Bash(git add .)",
+      "Bash(herdr server stop*)",
+      "Read(.env)"
+    ]
+  },
+  "env": {
+    "FLEET_SOFT_TOKENS": "200000",
+    "FLEET_HARD_TOKENS": "250000",
+    "FLEET_PORT_BASE": "__P__90",
+    "FLEET_AUTOCOMPACT": "300000"
+  }
+}

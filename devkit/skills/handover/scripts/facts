@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# facts: the git facts a handover needs, printed for pasting (branch, HEAD, recent commits, status, diff vs main).
+set -uo pipefail
+git rev-parse --git-dir > /dev/null 2>&1 || { echo "not a git repo"; exit 0; }
+echo "agent: ${FLEET_AGENT:-supervisor}  port: ${FLEET_PORT:-—}  cwd: $(pwd)"
+echo "branch: $(git rev-parse --abbrev-ref HEAD)  HEAD: $(git rev-parse --short HEAD)  at: $(date '+%F %H:%M %Z')"
+echo "-- recent commits"
+git log --oneline -12
+echo "-- uncommitted"
+git status --short | head -40
+[ -z "$(git status --porcelain)" ] && echo "(clean)"
+if git rev-parse --verify -q main > /dev/null && [ "$(git rev-parse --abbrev-ref HEAD)" != main ]; then
+    echo "-- vs main ($(git rev-list --count main..HEAD) ahead, $(git rev-list --count HEAD..main) behind)"
+    git diff --stat main...HEAD | tail -15
+fi

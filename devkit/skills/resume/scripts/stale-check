@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# stale-check [name]: compare docs/handovers/<name>.md with the repo now: commits since the handover's
+# "after <sha>", files changed since, uncommitted work. Prints facts only; the agent decides what they mean.
+set -uo pipefail
+name="${1:-${FLEET_AGENT:-supervisor}}"
+file="docs/handovers/$name.md"
+[ -f "$file" ] || { echo "no handover at $file: fresh start (read the brief, or ask the supervisor)"; exit 0; }
+sha="$(grep -m1 -oE 'after [0-9a-f]{7,40}' "$file" | awk '{print $2}')"
+echo "handover: $file  (written $(git log -1 --format='%cr, %h' -- "$file" 2>/dev/null || echo 'uncommitted'))"
+if [ -z "$sha" ] || ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+    echo "WARN no valid 'after <sha>' in the handover header: verify every claim against git"
+else
+    count="$(git rev-list --count "$sha"..HEAD)"
+    echo "since $sha: $count commit(s)"
+    [ "$count" -gt 0 ] && git log --oneline "$sha"..HEAD | head -20 && echo "-- files changed since" &&
+        git diff --stat "$sha"..HEAD | tail -12
+fi
+echo "-- uncommitted now"
+git status --short | head -30
+[ -z "$(git status --porcelain)" ] && echo "(clean)"

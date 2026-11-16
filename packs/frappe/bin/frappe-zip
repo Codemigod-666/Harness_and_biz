@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# frappe-zip: snapshot the Frappe workspace into its git remote, prove the snapshot is complete, then wipe it.
+#   frappe-zip [--no-wipe] [--keep-db] [--remote <url>]
+# Saved: everything git tracks (custom apps, docs, settings), .zip/bench.lock.json (exact versions),
+#        .zip/sites/<site>.tar.gpg (encrypted DB + files + site_config + row counts), .zip/memory (Claude memory),
+#        .zip/HANDOVER.md (written by Claude before this runs).
+# Rebuilt by frappe-zap: the bench itself (env, upstream apps, assets, config, logs).
+# Nothing is deleted unless the push, a fresh clone and a decrypt test all succeed.
+# Config: ~/.config/frappe-zip/config (WORKSPACE, REPO) and ~/.config/frappe-zip/key (backup passphrase).
+set -euo pipefail
+die() { echo "frappe-zip: $*" >&2; exit 1; }
+step() { printf '\n== %s\n' "$*"; }
+
+CONF="${FRAPPE_ZIP_CONF:-$HOME/.config/frappe-zip}"
+[[ -f "$CONF/config" ]] || die "no $CONF/config (WORKSPACE=..., REPO=...)"
+# shellcheck disable=SC1091
+source "$CONF/config"
+KEY="$CONF/key"
+[[ -s "$KEY" ]] || die "no backup passphrase at $KEY"
+
+WIPE=1 KEEP_DB=0 REMOTE="${REPO:-}"
+while (($#)); do
+    case "$1" in
+    --no-wipe) WIPE=0; shift ;;
+    --keep-db) KEEP_DB=1; shift ;;
+    --remote) REMOTE="$2"; shift 2 ;;
+    *) die "unknown option $1" ;;
+    esac
+done
+[[ -n "$REMOTE" ]] || die "no REPO in $CONF/config"
+
+WS="$(realpath "$WORKSPACE")"
+[[ "$WS" == "$HOME"/?* ]] || die "WORKSPACE must be inside \$HOME, got $WS"
+cd "$WS"
+[[ "$(git rev-parse --show-toplevel 2>/dev/null)" == "$WS" ]] || die "$WS is not a git repo root"
+# shellcheck disable=SC1091
+source .zip/config.env # BENCH, CUSTOM_APPS
+B="$WS/$BENCH"
+START=$(date +%s)
+TAG="zip-$(date +%Y%m%d-%H%M%S)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+is_custom() { [[ " $CUSTOM_APPS " == *" $1 "* ]]; }
+
+sites() {
+    local d
+    for d in "$B"/sites/*/; do
+        d="${d%/}"
+        [[ -f "$d/site_config.json" ]] && basename "$d"
+    done
+}
+
+counts() { # <site>: exact row count of every table, sorted
+    local q
+    q="$(cd "$B" && bench --site "$1" mariadb -N -e "SET SESSION group_concat_max_len = 4194304;
+        SELECT GROUP_CONCAT(CONCAT('SELECT ''', table_name, ''', COUNT(*) FROM \`', table_name, '\`')
+        SEPARATOR ' UNION ALL ') FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'")"
+    (cd "$B" && bench --site "$1" mariadb -N -e "SELECT * FROM ($q) t ORDER BY 1")
+}
+
+step "preflight"
+for pid in $(pgrep -f honcho || true); do
+    [[ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" == "$B" ]] && die "the bench is running (bench start): stop it and retry"
+done
+pgrep -f "$B/env/bin/" >/dev/null && die "a process from $B/env is running: stop the bench and retry"
+git ls-remote "$REMOTE" >/dev/null 2>&1 || die "cannot reach $REMOTE (GitHub login?)"
+[[ -f .zip/HANDOVER.md ]] || die ".zip/HANDOVER.md missing: write the handover first"
+(($(date +%s) - $(stat -c %Y .zip/HANDOVER.md) < 3600)) || die ".zip/HANDOVER.md is older than an hour: update it first"
+for app in $CUSTOM_APPS; do
+    grep -qxF "!/$BENCH/apps/$app/" .gitignore || die ".gitignore does not track $BENCH/apps/$app (add !/$BENCH/apps/$app/)"
+    [[ ! -e "$B/apps/$app/.git" ]] || die "$app has its own .git: absorb it into the workspace repo first"
+done
+if ((WIPE)); then
+    bad="$(find "$WS" ! -user "$USER" -print -quit)"
+    [[ -z "$bad" ]] || die "not owned by you, the wipe would fail: $bad  (sudo chown -R $USER: $WS)"
+fi
+mapfile -t SITES < <(sites)
+((${#SITES[@]})) || die "no sites in $B/sites"
+echo "sites: ${SITES[*]}"
+
+step "inventory: everything not in git must be rebuildable"
+unknown=()
+while IFS= read -r p; do
+    case "$p" in
+    */__pycache__/ | *.pyc | */node_modules/ | *.egg-info/ | .zip/tmp/) continue ;;
+    "$BENCH"/*) ;;
+    *) unknown+=("$p"); continue ;;
+    esac
+    rel="${p#"$BENCH"/}"
+    case "$rel" in
+    env/ | config/ | logs/ | Procfile | patches.txt | sites/) ;;
+    apps/*/)
+        app="${rel#apps/}"; app="${app%/}"
+        if is_custom "$app"; then unknown+=("$p (custom app ignored by git?)")
+        elif [[ -z "$(git -C "$B/apps/$app" remote 2>/dev/null)" ]]; then unknown+=("$p (no git remote: add it to CUSTOM_APPS)")
+        elif [[ -n "$(git -C "$B/apps/$app" status --porcelain)" ]]; then unknown+=("$p (local changes in an upstream app)")
+        elif [[ -z "$(git -C "$B/apps/$app" branch -r --contains HEAD 2>/dev/null)" ]]; then
+            unknown+=("$p (local commits not on its remote)")
+        fi ;;
+    *) unknown+=("$p") ;;
+    esac
+done < <(git ls-files --others --ignored --exclude-standard --directory)
+for f in "$B"/sites/*; do
+    n="$(basename "$f")"
+    case "$n" in assets | apps.txt | apps.json | common_site_config.json | currentsite.txt) continue ;; esac
+    [[ -f "$f/site_config.json" ]] || { unknown+=("$BENCH/sites/$n"); continue; }
+    for c in "$f"/* "$f"/.[!.]*; do
+        [[ -e "$c" ]] || continue
+        case "$(basename "$c")" in site_config.json | logs | locks | private | public) ;; *) unknown+=("${c#"$WS"/}") ;; esac
+    done
+    for c in "$f"/private/*; do [[ -e "$c" ]] && case "$(basename "$c")" in files | backups) ;; *) unknown+=("${c#"$WS"/}") ;; esac; done
+    for c in "$f"/public/*; do [[ -e "$c" ]] && case "$(basename "$c")" in files) ;; *) unknown+=("${c#"$WS"/}") ;; esac; done
+done
+if ((${#unknown[@]})); then
+    printf '  would be lost: %s\n' "${unknown[@]}" >&2
+    die "files that are neither in git nor rebuildable; track or remove them, then retry"
+fi
+echo "ok"
+
+step "lock: exact versions"
+B="$B" CUSTOM="$CUSTOM_APPS" TAG="$TAG" SITES="${SITES[*]}" python3 - <<'PY'
+import json, os, subprocess
+b = os.environ["B"]
+def run(*a, cwd=None):
+    return subprocess.run(a, cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+custom = os.environ["CUSTOM"].split()
+order = [l.strip() for l in open(f"{b}/sites/apps.txt") if l.strip()]
+upstream = []
+for app in sorted(os.listdir(f"{b}/apps")):
+    if app in custom or not os.path.isdir(f"{b}/apps/{app}"):
+        continue
+    d = f"{b}/apps/{app}"
+    remote = run("git", "remote", cwd=d).splitlines()[0]
+    upstream.append({"name": app, "remote": remote, "url": run("git", "remote", "get-url", remote, cwd=d),
+                     "branch": run("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=d),
+                     "commit": run("git", "rev-parse", "HEAD", cwd=d)})
+lock = {
+    "tag": os.environ["TAG"],
+    "bench": run("bench", "--version", cwd=b),
+    "python": run(f"{b}/env/bin/python", "-c", "import platform; print(platform.python_version())"),
+    "node": run("node", "-v").lstrip("v"),
+    "apps_order": order, "upstream_apps": upstream, "custom_apps": custom,
+    "sites": os.environ["SITES"].split(),
+    # values travel encrypted in .zip/common_site_config.json.gpg (they may hold secrets); only key names here
+    "common_site_config_keys": sorted(json.load(open(f"{b}/sites/common_site_config.json"))),
+}
+json.dump(lock, open(".zip/bench.lock.json", "w"), indent=2)
+print("  frappe stack:", ", ".join(f"{a['name']}@{a['commit'][:7]}" for a in upstream), "| python", lock["python"], "| node", lock["node"])
+PY
+
+step "backup sites (encrypted)"
+encrypt() { gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-file "$KEY" --symmetric --cipher-algo AES256 -o "$2" "$1"; }
+encrypt "$B/sites/common_site_config.json" .zip/common_site_config.json.gpg
+rm -rf .zip/sites && mkdir -p .zip/sites
+for s in "${SITES[@]}"; do
+    d="$TMP/$s"
+    mkdir -p "$d/backup"
+    counts "$s" >"$d/counts.tsv"
+    (cd "$B" && bench --site "$s" backup --with-files --backup-path "$d/backup" >/dev/null)
+    ls "$d"/backup/*-database.sql.gz >/dev/null 2>&1 || die "$s: backup produced no database file"
+    cp "$B/sites/$s/site_config.json" "$d/"
+    tar -C "$d" -cf "$TMP/$s.tar" .
+    sha256sum "$TMP/$s.tar" | cut -d' ' -f1 >".zip/sites/$s.sha256"
+    encrypt "$TMP/$s.tar" ".zip/sites/$s.tar.gpg"
+    size=$(stat -c %s ".zip/sites/$s.tar.gpg")
+    ((size < 95 * 1024 * 1024)) || die "$s: encrypted backup is $((size / 1048576)) MB; GitHub's limit is 100 MB"
+    echo "  $s: $(wc -l <"$d/counts.tsv") tables, $(awk '{n+=$2} END {print n}' "$d/counts.tsv") rows, $((size / 1024)) KB"
+done
+
+step "Claude memory"
+SLUG="$(sed 's#[^A-Za-z0-9]#-#g' <<<"$WS")"
+MEM="$HOME/.claude/projects/$SLUG/memory"
+rm -rf .zip/memory
+if [[ -d "$MEM" ]]; then cp -rL "$MEM" .zip/memory && echo "  $(ls .zip/memory | wc -l) files"; else echo "  none"; fi
+
+step "commit and push $TAG"
+git add -A
+git -c core.hooksPath=/dev/null commit -q -m "zip: $TAG" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" || die "nothing to commit?"
+git tag "$TAG"
+git push -q "$REMOTE" "HEAD:refs/heads/main" "refs/tags/$TAG" || die "push failed; nothing was deleted"
+
+step "verify from a fresh clone"
+git clone -q --branch "$TAG" "$REMOTE" "$TMP/verify" 2>/dev/null || die "fresh clone failed; nothing was deleted"
+[[ "$(git -C "$TMP/verify" rev-parse HEAD)" == "$(git rev-parse HEAD)" ]] || die "remote HEAD differs; nothing was deleted"
+gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$KEY" -d "$TMP/verify/.zip/common_site_config.json.gpg" |
+    cmp -s - "$B/sites/common_site_config.json" || die "common_site_config backup does not decrypt to the original; nothing was deleted"
+for s in "${SITES[@]}"; do
+    gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$KEY" -d "$TMP/verify/.zip/sites/$s.tar.gpg" >"$TMP/check.tar" ||
+        die "$s: cannot decrypt the pushed backup; nothing was deleted"
+    [[ "$(sha256sum "$TMP/check.tar" | cut -d' ' -f1)" == "$(cat "$TMP/verify/.zip/sites/$s.sha256")" ]] || die "$s: checksum mismatch; nothing was deleted"
+    tar -xOf "$TMP/check.tar" --wildcards '*-database.sql.gz' | gzip -t || die "$s: database dump is corrupt; nothing was deleted"
+    tar -tf "$TMP/check.tar" ./site_config.json ./counts.tsv >/dev/null || die "$s: backup incomplete; nothing was deleted"
+    echo "  $s: decrypts, checksum ok, dump ok"
+done
+
+step "safety copy (kept 7 days)"
+SAFE="$HOME/.cache/frappe-zip-last/$TAG"
+mkdir -p "$SAFE"
+git bundle create -q "$SAFE/workspace.bundle" --all
+cp .zip/sites/*.gpg "$SAFE/"
+find "$HOME/.cache/frappe-zip-last" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +
+echo "  $SAFE"
+
+if ((WIPE)); then
+    if ((!KEEP_DB)); then
+        step "drop site databases"
+        for s in "${SITES[@]}"; do
+            eval "$(python3 -c 'import json,sys,shlex; c=json.load(open(sys.argv[1]))
+print(f"DBN={shlex.quote(c[\"db_name\"])} DBU={shlex.quote(c.get(\"db_user\", c[\"db_name\"]))} DBP={shlex.quote(c[\"db_password\"])}")' "$B/sites/$s/site_config.json")"
+            MYSQL_PWD="$DBP" mysql -u "$DBU" -e "DROP DATABASE \`$DBN\`" || die "$s: could not drop $DBN (the workspace is pushed; nothing was deleted)"
+            echo "  dropped $DBN"
+        done
+    fi
+    step "wipe $WS"
+    cd /
+    find "$WS" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    [[ -z "$(ls -A "$WS")" ]] || die "wipe incomplete: $(ls -A "$WS" | head -3)"
+fi
+
+printf '\nZIP %s done in %ss%s\n' "$TAG" "$(($(date +%s) - START))" "$( ((WIPE)) && echo ", $WS is empty" || echo " (no wipe)")"

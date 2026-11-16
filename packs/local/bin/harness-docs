@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# harness-docs: serve the harness field guide (docs/site in the playbook) on a local port. Local only:
+# binds 127.0.0.1, never publishes anywhere.
+#   harness-docs start | stop | status | url | path
+set -euo pipefail
+readonly SITE="$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)/docs/site"
+readonly PORT="${HARNESS_DOCS_PORT:-4700}"
+readonly PIDFILE="${XDG_RUNTIME_DIR:-$HOME/.cache}/harness-docs.pid"
+running() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+url() { echo "http://127.0.0.1:$PORT/"; }
+case "${1:-status}" in
+start)
+    if running; then echo "already serving $(url)"; exit 0; fi
+    [[ -f "$SITE/index.html" ]] || { echo "harness-docs: no $SITE/index.html" >&2; exit 1; }
+    mkdir -p "$(dirname "$PIDFILE")"
+    nohup python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$SITE" >/dev/null 2>&1 &
+    echo $! >"$PIDFILE"
+    sleep 0.5
+    running || { echo "harness-docs: server did not start (port $PORT in use? set HARNESS_DOCS_PORT)" >&2; exit 1; }
+    echo "serving $(url)" ;;
+stop) if running; then kill "$(cat "$PIDFILE")"; rm -f "$PIDFILE"; echo stopped; else echo "not running"; fi ;;
+status) if running; then echo "serving $(url) (pid $(cat "$PIDFILE"))"; else echo "not running"; fi ;;
+url) url ;;
+path) echo "$SITE/index.html" ;;
+*) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

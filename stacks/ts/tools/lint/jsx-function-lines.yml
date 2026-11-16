@@ -1,0 +1,28 @@
+id: jsx-function-lines
+language: tsx
+severity: error
+message: React component over 40 lines (GEN-2; Biome skips functions that return JSX)
+rule:
+  kind: function_declaration
+  regex: "^(?:[^\\n]*\\n){40,}"
+  has:
+    stopBy: end
+    any:
+      - kind: jsx_element
+      - kind: jsx_self_closing_element
+---
+id: jsx-arrow-lines
+language: tsx
+severity: error
+message: React arrow component over 40 lines (GEN-2; Biome skips functions that return JSX)
+rule:
+  kind: variable_declarator
+  regex: "^(?:[^\\n]*\\n){40,}"
+  has:
+    field: value
+    kind: arrow_function
+    has:
+      stopBy: end
+      any:
+        - kind: jsx_element
+        - kind: jsx_self_closing_element

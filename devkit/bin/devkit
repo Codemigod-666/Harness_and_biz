@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# devkit: make a repo devkit-ready (init), report what is missing (doctor), and give every gate a stack-neutral
+# name (check, test, gate, e2e). Config: .devkit/config.env at the repo root (shell-sourced KEY="value" lines).
+# Needs bash, git, python3.
+set -euo pipefail
+
+readonly SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+readonly PLUGIN_ROOT="$(dirname "$(dirname "$SELF")")"
+readonly CORE_DIR="${DEVKIT_CORE_DIR:-$PLUGIN_ROOT/templates/core}"
+readonly CARDS_DIR="${DEVKIT_CARDS_DIR:-$PLUGIN_ROOT/templates/conventions}"
+readonly MARKER="<!-- devkit -->"
+
+usage() {
+    cat <<'EOF'
+devkit: project-free devkit workflow (backlog, briefs, fleet, handovers, conventions)
+  init [--yes] [--cards go,ts,…]   make this git repo devkit-ready; never overwrites (added/kept per path)
+  check | test | gate | e2e        run the command configured in .devkit/config.env, exit code passed through
+  doctor                           report each prerequisite as ok/missing
+Config keys (.devkit/config.env): DEVKIT_CHECK DEVKIT_TEST DEVKIT_GATE DEVKIT_E2E DEVKIT_PORT_BASE DEVKIT_MAIN
+EOF
+}
+
+die() { echo "devkit: $*" >&2; exit "${2:-1}"; }
+
+repo_root() { git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repo"; }
+
+load_config() { # <file>: read DEVKIT_*="value" lines as data (never sourced), unquoted values allowed
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^(DEVKIT_[A-Z0-9_]+)=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+        [[ "$val" =~ ^\"(.*)\"$ ]] && val="${BASH_REMATCH[1]}"
+        printf -v "$key" '%s' "$val"
+    done <"$1"
+}
+
+# ---- gates -----------------------------------------------------------------------------------------------
+
+run_gate() { # <name> <KEY> [fallback KEY]
+    local root cmd
+    root="$(repo_root)"
+    local cfg="$root/.devkit/config.env"
+    [[ -f "$cfg" ]] && load_config "$cfg"
+    cmd="${!2:-}"
+    [[ -z "$cmd" && -n "${3:-}" ]] && cmd="${!3:-}"
+    if [[ -z "$cmd" ]]; then
+        if [[ "$1" == gate ]]; then
+            die "DEVKIT_GATE is not set: run \`devkit init\` or add DEVKIT_GATE=\"<command>\" to .devkit/config.env" 2
+        fi
+        echo "devkit $1: not configured (set $2 in .devkit/config.env)"
+        return 0
+    fi
+    cd "$root"
+    exec bash -c "$cmd"
+}
+
+# ---- detection -------------------------------------------------------------------------------------------
+
+has_target() { grep -Eq "^$2[[:space:]]*:" "$1" 2>/dev/null; }
+
+detect_frappe() { # prints the detection line for a Frappe app (hooks.py next to modules.txt), else nothing
+    local root="$1" hooks app cmd
+    hooks="$(find "$root" -maxdepth 3 -name hooks.py -not -path '*/node_modules/*' 2>/dev/null | head -50 |
+        while IFS= read -r h; do [[ -f "$(dirname "$h")/modules.txt" ]] && echo "$h" && break; done)"
+    [[ -n "$hooks" ]] || return 0
+    app="$(basename "$(dirname "$hooks")")"
+    [[ "$app" =~ ^[A-Za-z0-9_]+$ ]] || return 0
+    cmd="bench --site \${DEVKIT_SITE:-site1.local} run-tests --app $app"
+    echo "frappe app $app||$cmd|$cmd|python"
+}
+
+detect() { # prints: STACK|CHECK|TEST|GATE|CARDS  (first match wins)
+    local root="$1" pm frappe
+    if [[ -f "$root/justfile" ]]; then
+        local c="" t="" g=""
+        has_target "$root/justfile" check && c="just check"
+        has_target "$root/justfile" test && t="just test"
+        has_target "$root/justfile" gate && g="just gate"
+        [[ -n "$g" ]] || g="${t:-$c}"
+        echo "justfile|$c|$t|$g|"
+    elif [[ -f "$root/Makefile" ]]; then
+        local c="" t="" g=""
+        has_target "$root/Makefile" check && c="make check"
+        has_target "$root/Makefile" test && t="make test"
+        has_target "$root/Makefile" gate && g="make gate"
+        [[ -n "$g" ]] || g="${t:-$c}"
+        echo "Makefile|$c|$t|$g|"
+    elif frappe="$(detect_frappe "$root")" && [[ -n "$frappe" ]]; then
+        echo "$frappe"
+    elif [[ -f "$root/package.json" ]]; then
+        pm=npm
+        [[ -f "$root/pnpm-lock.yaml" ]] && pm=pnpm
+        [[ -f "$root/yarn.lock" ]] && pm=yarn
+        python3 - "$root/package.json" "$pm" <<'PY'
+import json, sys
+pkg = json.load(open(sys.argv[1]))
+pm = sys.argv[2]
+scripts = pkg.get("scripts", {})
+run = lambda s: f"{pm} test" if s == "test" else f"{pm} run {s}"
+c = run("lint") if "lint" in scripts else (run("typecheck") if "typecheck" in scripts else "")
+t = run("test") if "test" in scripts else ""
+g = " && ".join(x for x in (c, t) if x)
+deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+cards = "typescript" + (",react" if "react" in deps else "")
+print(f"package.json ({pm})|{c}|{t}|{g}|{cards}")
+PY
+    elif [[ -f "$root/go.mod" ]]; then
+        echo "go.mod|go vet ./...|go test ./...|go vet ./... && go test ./...|go"
+    elif [[ -f "$root/pyproject.toml" || -f "$root/requirements.txt" ]]; then
+        local c=""
+        grep -qs 'ruff' "$root/pyproject.toml" "$root/requirements.txt" 2>/dev/null && c="ruff check ."
+        echo "python|$c|pytest|${c:+$c && }pytest|python"
+    elif [[ -f "$root/Cargo.toml" ]]; then
+        echo "Cargo.toml|cargo clippy|cargo test|cargo clippy && cargo test|"
+    else
+        echo "none||||"
+    fi
+}
+
+confirm() { # <question>: yes unless the user types n; non-interactive stdin counts as yes
+    [[ -t 0 ]] || return 0
+    local a
+    read -r -p "$1 [Y/n] " a
+    [[ ! "$a" =~ ^[nN] ]]
+}
+
+# ---- init ------------------------------------------------------------------------------------------------
+
+added() { echo "added $1"; }
+kept() { echo "kept $1"; }
+
+write_config() { # <root> <yes>
+    local root="$1" yes="$2" det stack check test gate cards
+    local cfg="$root/.devkit/config.env"
+    if [[ -f "$cfg" ]]; then
+        kept ".devkit/config.env"
+        return
+    fi
+    det="$(detect "$root")"
+    IFS='|' read -r stack check test gate cards <<<"$det"
+    echo "detected: $stack"
+    echo "  DEVKIT_CHECK=\"$check\""
+    echo "  DEVKIT_TEST=\"$test\""
+    echo "  DEVKIT_GATE=\"$gate\""
+    if [[ "$yes" != 1 ]] && ! confirm "use these?"; then
+        check="" test="" gate=""
+    fi
+    mkdir -p "$root/.devkit"
+    {
+        echo "# devkit config (shell-sourced). Commands run from the repo root with bash -c."
+        [[ -n "$check" ]] && echo "DEVKIT_CHECK=\"$check\"" || echo "# DEVKIT_CHECK=\"\"   # fast checks: lint, types"
+        [[ -n "$test" ]] && echo "DEVKIT_TEST=\"$test\"" || echo "# DEVKIT_TEST=\"\"    # tests"
+        if [[ -n "$gate" ]]; then
+            echo "DEVKIT_GATE=\"$gate\""
+        else
+            echo "# TODO: DEVKIT_GATE=\"\"   # everything that must be green before landing"
+        fi
+        echo "# DEVKIT_E2E=\"\"     # end-to-end, run on \$FLEET_PORT (defaults to DEVKIT_CHECK)"
+        echo "# DEVKIT_PORT_BASE=4790   # fleet test ports are base+1..9"
+        echo "# DEVKIT_MAIN=main"
+    } >"$cfg"
+    added ".devkit/config.env"
+    DETECTED_CARDS="$cards"
+}
+
+copy_tree() { # <root>: core template tree, never overwriting; AGENTS.md/CLAUDE.md/.gitignore are merged below
+    local root="$1" rel
+    [[ -d "$CORE_DIR" ]] || die "templates not found at $CORE_DIR (is the devkit plugin complete?)"
+    while IFS= read -r rel; do
+        rel="${rel#./}"
+        case "$rel" in AGENTS.md | CLAUDE.md | .gitignore | .devkit/config.env) continue ;; esac
+        if [[ -e "$root/$rel" ]]; then
+            kept "$rel"
+        else
+            mkdir -p "$(dirname "$root/$rel")"
+            cp "$CORE_DIR/$rel" "$root/$rel"
+            added "$rel"
+        fi
+    done < <(cd "$CORE_DIR" && find . -type f | sort)
+}
+
+agents_section() { # the core template's AGENTS.md; a built-in copy only when the template is missing
+    if [[ -f "$CORE_DIR/AGENTS.md" ]]; then
+        cat "$CORE_DIR/AGENTS.md"
+        return
+    fi
+    cat <<EOF
+$MARKER
+## devkit
+
+This repo uses the devkit workflow (backlog, briefs, fleet, handovers).
+- Gates: \`devkit check\`, \`devkit test\`, \`devkit gate\`, \`devkit e2e\` (commands in \`.devkit/config.env\`).
+- Tasks: \`docs/backlog/INDEX.md\` (\`backlog\` command). How we work: \`docs/fleet/\`.
+- Context seams at 200k / 250k: handover, clear, resume (\`docs/fleet/CONTEXT.md\`).
+EOF
+}
+
+merge_agents() { # <root>
+    local root="$1" f="$root/AGENTS.md"
+    if [[ ! -f "$f" ]]; then
+        { echo "# $(basename "$root")"; echo; agents_section; } >"$f"
+        added "AGENTS.md"
+    elif grep -qF "$MARKER" "$f" || grep -q '^## devkit' "$f"; then
+        kept "AGENTS.md"
+    else
+        { echo; agents_section; } >>"$f"
+        added "AGENTS.md (## devkit section)"
+    fi
+    local c="$root/CLAUDE.md"
+    if [[ ! -f "$c" ]]; then
+        echo "@AGENTS.md" >"$c"
+        added "CLAUDE.md"
+    elif grep -qF '@AGENTS.md' "$c"; then
+        kept "CLAUDE.md"
+    else
+        printf '\n@AGENTS.md\n' >>"$c"
+        added "CLAUDE.md (@AGENTS.md)"
+    fi
+    local g="$root/.gitignore"
+    if [[ -f "$g" ]] && grep -qxF '.claude/fleet/' "$g"; then
+        kept ".gitignore"
+    else
+        echo '.claude/fleet/' >>"$g"
+        added ".gitignore (.claude/fleet/)"
+    fi
+}
+
+copy_cards() { # <root> <cards csv>
+    local root="$1" c src
+    local -A seen=()
+    IFS=',' read -ra list <<<"$2"
+    for c in "${list[@]}"; do
+        c="${c// /}"
+        case "$c" in ts) c=typescript ;; py) c=python ;; esac
+        [[ -n "$c" && -z "${seen[$c]:-}" ]] || continue
+        seen[$c]=1
+        src="$CARDS_DIR/$c.md"
+        if [[ ! -f "$src" ]]; then
+            echo "skipped card $c (no $src)"
+        elif [[ -e "$root/docs/conventions/$c.md" ]]; then
+            kept "docs/conventions/$c.md"
+        else
+            mkdir -p "$root/docs/conventions"
+            cp "$src" "$root/docs/conventions/$c.md"
+            added "docs/conventions/$c.md"
+        fi
+    done
+}
+
+cmd_init() {
+    local yes=0 cards=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        --yes | -y) yes=1; shift ;;
+        --cards) cards="${2:?--cards needs a list}"; shift 2 ;;
+        *) die "unknown option $1" ;;
+        esac
+    done
+    local root
+    root="$(repo_root)"
+    DETECTED_CARDS=""
+    write_config "$root" "$yes"
+    copy_tree "$root"
+    merge_agents "$root"
+    local all="${cards:+$cards,}${DETECTED_CARDS:-}"
+    [[ -z "$all" ]] || copy_cards "$root" "$all"
+    echo "next: review and commit, then run herdr and /devkit:supervise"
+}
+
+# ---- doctor ----------------------------------------------------------------------------------------------
+
+cmd_doctor() {
+    local bad=0 root="" gate=""
+    ok() { echo "ok      $1"; }
+    miss() { echo "missing $1"; bad=1; }
+    if root="$(git rev-parse --show-toplevel 2>/dev/null)"; then ok "git repo ($root)"; else miss "git repo"; fi
+    if [[ -n "$root" && -f "$root/.devkit/config.env" ]]; then
+        ok ".devkit/config.env"
+        gate="$(DEVKIT_GATE=; load_config "$root/.devkit/config.env"; echo "$DEVKIT_GATE")"
+        if [[ -n "$gate" ]]; then ok "DEVKIT_GATE ($gate)"; else miss "DEVKIT_GATE (set it in .devkit/config.env)"; fi
+    else
+        miss ".devkit/config.env (run devkit init)"
+    fi
+    command -v python3 >/dev/null && ok "python3" || miss "python3"
+    if [[ -n "$(git config user.name || true)" && -n "$(git config user.email || true)" ]]; then
+        ok "git identity"
+    else
+        miss "git identity (git config user.name / user.email)"
+    fi
+    command -v herdr >/dev/null && ok "herdr (fleet)" || echo "missing herdr (only needed for fleet)"
+    local ver
+    ver="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' "$PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null || true)"
+    if [[ -n "$ver" ]]; then ok "devkit plugin $ver"; else echo "missing plugin version ($PLUGIN_ROOT/.claude-plugin/plugin.json)"; fi
+    return $bad
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+    init) cmd_init "$@" ;;
+    check) run_gate check DEVKIT_CHECK ;;
+    test) run_gate test DEVKIT_TEST ;;
+    gate) run_gate gate DEVKIT_GATE ;;
+    e2e) run_gate e2e DEVKIT_E2E DEVKIT_CHECK ;;
+    doctor) cmd_doctor ;;
+    *) usage ;;
+    esac
+}
+
+main "$@"

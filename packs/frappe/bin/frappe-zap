@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# frappe-zap: rebuild the Frappe workspace from its git remote, exactly as the last Zip left it.
+#   frappe-zap [--into <dir>] [--ref <tag|branch>] [--remote <url>] [--rehearse]
+# Clones the workspace, rebuilds the bench at the locked versions, restores every site (DB, files, the original
+# site_config with its keys), proves the row counts match the Zip, then restores Claude memory.
+# --rehearse: restore under different database names (suffix _zr) and skip memory/accounts, so it can run beside
+#             the live workspace. Use with --into <scratch dir>.
+# Config: ~/.config/frappe-zip/{config,key,db_root}.
+set -euo pipefail
+die() { echo "frappe-zap: $*" >&2; exit 1; }
+step() { printf '\n== %s  (+%ss)\n' "$*" "$(($(date +%s) - START))"; }
+START=$(date +%s)
+
+CONF="${FRAPPE_ZIP_CONF:-$HOME/.config/frappe-zip}"
+[[ -f "$CONF/config" ]] || die "no $CONF/config"
+# shellcheck disable=SC1091
+source "$CONF/config"
+KEY="$CONF/key"
+[[ -s "$KEY" ]] || die "no backup passphrase at $KEY (copy it from your password manager)"
+[[ -s "$CONF/db_root" ]] || die "no MariaDB root password at $CONF/db_root"
+DB_ROOT="$(<"$CONF/db_root")"
+
+TARGET="$WORKSPACE" REF=main REMOTE="${REPO:-}" REHEARSE=0
+while (($#)); do
+    case "$1" in
+    --into) TARGET="$2"; shift 2 ;;
+    --ref) REF="$2"; shift 2 ;;
+    --remote) REMOTE="$2"; shift 2 ;;
+    --rehearse) REHEARSE=1; shift ;;
+    *) die "unknown option $1" ;;
+    esac
+done
+[[ -n "$REMOTE" ]] || die "no REPO in $CONF/config"
+mkdir -p "$TARGET"
+TARGET="$(realpath "$TARGET")"
+[[ -z "$(ls -A "$TARGET")" ]] || die "$TARGET is not empty (Zip first, or pick another --into)"
+TMP="$(mktemp -d)"
+REDIS_PIDS=()
+ROOT_PW_IN=() # site_config files currently holding the root password (removed on any exit)
+conf_key() { # <site_config> set <key> <value> | del <key>
+    python3 - "$@" <<'PY'
+import json, os, sys
+p, op, key = sys.argv[1:4]
+c = json.load(open(p))
+if op == "set": c[key] = sys.stdin.readline().rstrip("\n")
+else: c.pop(key, None)
+fd = os.open(p + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f: json.dump(c, f, indent=1)
+os.replace(p + ".tmp", p)
+PY
+}
+cleanup() {
+    local p
+    for p in "${ROOT_PW_IN[@]}"; do [[ -f "$p" ]] && conf_key "$p" del mariadb_root_password </dev/null; done
+    for p in "${REDIS_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+step "preflight"
+command -v bench >/dev/null || die "bench CLI missing (uv tool install frappe-bench)"
+command -v redis-server >/dev/null || die "redis-server missing"
+MYSQL_PWD="$DB_ROOT" mysqladmin -u root ping >/dev/null 2>&1 || die "MariaDB not reachable as root (is it running? is db_root right?)"
+git ls-remote "$REMOTE" >/dev/null 2>&1 || die "cannot reach $REMOTE (GitHub login?)"
+
+step "clone $REF"
+git clone -q --branch "$REF" "$REMOTE" "$TARGET"
+cd "$TARGET"
+# shellcheck disable=SC1091
+source .zip/config.env # BENCH, CUSTOM_APPS
+B="$TARGET/$BENCH"
+eval "$(python3 - <<'PY'
+import json, shlex
+l = json.load(open(".zip/bench.lock.json"))
+f = next(a for a in l["upstream_apps"] if a["name"] == "frappe")
+print(f"TAG={shlex.quote(l['tag'])} PYVER={shlex.quote(l['python'])} NODEVER={shlex.quote(l['node'])}")
+print(f"FRAPPE_URL={shlex.quote(f['url'])} FRAPPE_BRANCH={shlex.quote(f['branch'])} FRAPPE_COMMIT={shlex.quote(f['commit'])}")
+print("SITES=(" + " ".join(shlex.quote(s) for s in l["sites"]) + ")")
+PY
+)"
+echo "  snapshot $TAG, frappe $FRAPPE_BRANCH@${FRAPPE_COMMIT:0:7}, sites: ${SITES[*]}"
+
+PYMM="${PYVER%.*}"
+PY="$(command -v "python$PYMM" || command -v python3)"
+[[ "$("$PY" -c 'import platform; print(platform.python_version().rsplit(".", 1)[0])')" == "$PYMM" ]] ||
+    die "need Python $PYMM (the Zip used $PYVER); found $("$PY" --version)"
+[[ "$(node -v | sed 's/^v//; s/\..*//')" == "${NODEVER%%.*}" ]] || echo "  warning: node $(node -v), the Zip used $NODEVER"
+
+step "bench init (the slow part)"
+mv "$B" "$TMP/tracked" # custom apps and bench-level files from git; put back after init
+(cd "$TARGET" && bench init "$BENCH" --frappe-path "$FRAPPE_URL" --frappe-branch "$FRAPPE_BRANCH" \
+    --python "$PY" --skip-assets --no-backups >"$TMP/init.log" 2>&1) || { tail -20 "$TMP/init.log" >&2; die "bench init failed (log above)"; }
+
+step "pin versions"
+pin() { # <app dir> <remote> <branch> <commit>
+    [[ "$(git -C "$1" rev-parse HEAD)" == "$4" ]] && return
+    git -C "$1" fetch -q --depth 1 "$2" "$4"
+    git -C "$1" checkout -q -B "$3" "$4"
+}
+pin "$B/apps/frappe" upstream "$FRAPPE_BRANCH" "$FRAPPE_COMMIT"
+while IFS=$'\t' read -r name url branch commit; do
+    [[ "$name" == frappe ]] && continue
+    (cd "$B" && bench get-app --branch "$branch" "$url" --skip-assets >/dev/null)
+    pin "$B/apps/$name" upstream "$branch" "$commit"
+done < <(python3 -c 'import json
+for a in json.load(open(".zip/bench.lock.json"))["upstream_apps"]: print(a["name"], a["url"], a["branch"], a["commit"], sep="\t")')
+cp -a "$TMP/tracked/." "$B/"
+gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$KEY" -d .zip/common_site_config.json.gpg >"$TMP/common.json" ||
+    die "cannot decrypt common_site_config (wrong key?)"
+python3 - "$B" "$TMP/common.json" <<'PY'
+import json, sys
+b, saved = sys.argv[1], sys.argv[2]
+l = json.load(open(".zip/bench.lock.json"))
+open(f"{b}/sites/apps.txt", "w").write("\n".join(l["apps_order"]) + "\n")
+c = json.load(open(f"{b}/sites/common_site_config.json"))
+c.update(json.load(open(saved)))  # the Zip's values win over bench init's defaults
+json.dump(c, open(f"{b}/sites/common_site_config.json", "w"), indent=1, sort_keys=True)
+PY
+(cd "$B" && bench setup requirements >"$TMP/req.log" 2>&1) || { tail -20 "$TMP/req.log" >&2; die "bench setup requirements failed"; }
+
+step "start redis for the restore"
+for conf in redis_cache redis_queue; do
+    [[ -f "$B/config/$conf.conf" ]] || continue
+    port="$(sed -n 's/^port //p' "$B/config/$conf.conf")"
+    if redis-cli -p "$port" ping >/dev/null 2>&1; then echo "  $conf already up on $port"; continue; fi
+    (cd "$B" && redis-server "config/$conf.conf" --daemonize no >/dev/null 2>&1 &)
+    sleep 0.5
+    REDIS_PIDS+=("$(pgrep -f "redis-server.*:$port" | head -1)")
+done
+
+step "restore sites"
+for s in "${SITES[@]}"; do
+    d="$TMP/site-$s"
+    mkdir -p "$d"
+    gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$KEY" -d ".zip/sites/$s.tar.gpg" >"$d.tar" || die "$s: cannot decrypt (wrong key?)"
+    [[ "$(sha256sum "$d.tar" | cut -d' ' -f1)" == "$(cat ".zip/sites/$s.sha256")" ]] || die "$s: checksum mismatch"
+    tar -C "$d" -xf "$d.tar"
+    mkdir -p "$B/sites/$s"
+    sc="$B/sites/$s/site_config.json"
+    install -m 600 "$d/site_config.json" "$sc"
+    if ((REHEARSE)); then
+        python3 - "$sc" <<'PY'
+import json, sys
+p = sys.argv[1]; c = json.load(open(p))
+c["db_name"] = c["db_name"][:61] + "_zr"; c["db_user"] = c["db_name"]
+json.dump(c, open(p, "w"), indent=1)
+PY
+    fi
+    # Frappe reads mariadb_root_password from the site config: keeps the password off the command line.
+    ROOT_PW_IN+=("$sc")
+    conf_key "$sc" set mariadb_root_password <<<"$DB_ROOT"
+    args=()
+    f=("$d"/backup/*-files.tar); [[ -e "${f[0]}" && "${f[0]}" != *private* ]] && args+=(--with-public-files "${f[0]}")
+    f=("$d"/backup/*-private-files.tar); [[ -e "${f[0]}" ]] && args+=(--with-private-files "${f[0]}")
+    (cd "$B" && bench --site "$s" restore "$(ls "$d"/backup/*-database.sql.gz)" "${args[@]}" \
+        --db-root-username root --force >"$TMP/restore-$s.log" 2>&1) ||
+        { tail -20 "$TMP/restore-$s.log" >&2; die "$s: restore failed"; }
+    conf_key "$sc" del mariadb_root_password </dev/null
+    grep -q mariadb_root_password "$sc" && die "$s: root password still in site_config"
+    q="$(cd "$B" && bench --site "$s" mariadb -N -e "SET SESSION group_concat_max_len = 4194304;
+        SELECT GROUP_CONCAT(CONCAT('SELECT ''', table_name, ''', COUNT(*) FROM \`', table_name, '\`')
+        SEPARATOR ' UNION ALL ') FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'")"
+    (cd "$B" && bench --site "$s" mariadb -N -e "SELECT * FROM ($q) t ORDER BY 1") >"$d/counts.after"
+    diff "$d/counts.tsv" "$d/counts.after" >"$d/counts.diff" || { cat "$d/counts.diff" >&2; die "$s: row counts differ from the Zip"; }
+    echo "  $s: $(wc -l <"$d/counts.after") tables, $(awk '{n+=$2} END {print n}' "$d/counts.after") rows, all match"
+done
+
+step "build assets and migrate"
+(cd "$B" && bench build >"$TMP/build.log" 2>&1) || { tail -20 "$TMP/build.log" >&2; die "bench build failed"; }
+for s in "${SITES[@]}"; do
+    (cd "$B" && bench --site "$s" migrate >"$TMP/migrate-$s.log" 2>&1) || { tail -20 "$TMP/migrate-$s.log" >&2; die "$s: migrate failed"; }
+done
+
+step "verify"
+for s in "${SITES[@]}"; do
+    [[ "$(cd "$B" && bench --site "$s" execute frappe.ping 2>/dev/null | tail -1)" == *pong* ]] || die "$s: frappe.ping failed"
+    apps="$(cd "$B" && bench --site "$s" list-apps 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ')"
+    echo "  $s: ping ok, apps: $apps"
+done
+[[ -z "$(git status --porcelain)" ]] || { git status --short >&2; die "the rebuilt workspace differs from git"; }
+echo "  git tree clean: tracked files are exactly the snapshot"
+
+if ((!REHEARSE)); then
+    step "Claude memory and accounts"
+    SLUG="$(sed 's#[^A-Za-z0-9]#-#g' <<<"$TARGET")"
+    MEM="$HOME/.claude/projects/$SLUG/memory"
+    if [[ -d .zip/memory ]]; then
+        mkdir -p "$MEM"
+        cp -rn .zip/memory/. "$MEM/"
+        echo "  memory: $(ls .zip/memory | wc -l) files (existing files kept)"
+    fi
+    [[ -f .claude/accounts.env ]] && command -v claude-acct >/dev/null && (cd "$TARGET" && claude-acct setup >/dev/null) && echo "  accounts: B links refreshed"
+fi
+
+printf '\nZAP %s done in %ss: %s\nResume from %s/.zip/HANDOVER.md\n' "$TAG" "$(($(date +%s) - START))" "$TARGET" "$TARGET"

@@ -1,0 +1,6 @@
+{
+  "name": "devkit-local",
+  "description": "Machine-local pack for the harness checkout: keeps the local field guide current and serves it on 127.0.0.1.",
+  "version": "0.2.0",
+  "author": { "name": "Rishi Khandagle" }
+}

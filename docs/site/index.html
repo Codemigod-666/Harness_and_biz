@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harness Field Guide</title>
+<meta name="description" content="How the Claude Code + herdr harness works: fleet, accounts A/B, devkit, context seams. Local only.">
+<style>
+:root {
+  --bg: #f7f6f2; --surface: #ffffff; --surface-2: #efede6; --text: #1d1c19; --muted: #5e5b53;
+  --line: #dcd8cc; --accent: #b4441c; --accent-soft: #f6e3d9; --a: #2f6f4f; --a-soft: #dcefe4;
+  --b: #2b5c9e; --b-soft: #dde8f6; --warn: #8a5a00; --warn-soft: #fbefd2; --code-bg: #f0eee7;
+  --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151412; --surface: #1d1c19; --surface-2: #26241f; --text: #ece9e1; --muted: #a8a397;
+    --line: #36332c; --accent: #f08a5d; --accent-soft: #3a2519; --a: #7fcca2; --a-soft: #1c3227;
+    --b: #8db6ee; --b-soft: #1c2a3d; --warn: #f2c260; --warn-soft: #3a2e12; --code-bg: #24221d;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151412; --surface: #1d1c19; --surface-2: #26241f; --text: #ece9e1; --muted: #a8a397;
+  --line: #36332c; --accent: #f08a5d; --accent-soft: #3a2519; --a: #7fcca2; --a-soft: #1c3227;
+  --b: #8db6ee; --b-soft: #1c2a3d; --warn: #f2c260; --warn-soft: #3a2e12; --code-bg: #24221d;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 16px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 var(--sans); }
+a { color: var(--accent); }
+.layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); max-width: 1180px; margin: 0 auto; }
+nav { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 28px 18px;
+  border-right: 1px solid var(--line); }
+nav .brand { font-weight: 700; letter-spacing: -0.01em; margin-bottom: 4px; }
+nav .meta { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+nav ol { list-style: none; padding: 0; margin: 0; counter-reset: s; }
+nav li a { display: block; padding: 5px 8px; border-radius: 6px; color: var(--text); text-decoration: none;
+  font-size: 14px; }
+nav li a:hover { background: var(--surface-2); }
+nav li a::before { counter-increment: s; content: counter(s, decimal-leading-zero); color: var(--muted);
+  font: 12px var(--mono); margin-right: 8px; }
+.theme { margin-top: 18px; font-size: 13px; background: var(--surface); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+main { padding: 36px 44px 80px; min-width: 0; }
+header.hero h1 { font-size: 34px; line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 10px; }
+header.hero p { color: var(--muted); font-size: 18px; max-width: 62ch; margin: 0; }
+section { margin-top: 56px; }
+h2 { font-size: 24px; letter-spacing: -0.01em; margin: 0 0 6px; }
+h2 + .lede { color: var(--muted); margin: 0 0 18px; max-width: 68ch; }
+h3 { font-size: 17px; margin: 26px 0 8px; }
+p, li { max-width: 72ch; }
+code { font: 0.88em var(--mono); background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px;
+  overflow-x: auto; font: 13.5px/1.55 var(--mono); }
+pre code { background: none; padding: 0; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+.grid .card h4 { margin: 0 0 6px; font-size: 15px; }
+.grid .card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+.tag { display: inline-block; font: 600 12px var(--mono); padding: 2px 8px; border-radius: 99px; }
+.tag.a { background: var(--a-soft); color: var(--a); } .tag.b { background: var(--b-soft); color: var(--b); }
+.note { border-left: 3px solid var(--warn); background: var(--warn-soft); padding: 12px 16px; border-radius: 0 8px 8px 0;
+  margin: 16px 0; }
+.note strong { color: var(--warn); }
+table { width: 100%; border-collapse: collapse; font-size: 14.5px; margin: 10px 0; }
+.table-wrap { overflow-x: auto; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 600; }
+ol.steps { counter-reset: st; list-style: none; padding: 0; }
+ol.steps > li { counter-increment: st; position: relative; padding: 0 0 18px 44px; max-width: none; }
+ol.steps > li::before { content: counter(st); position: absolute; left: 0; top: 0; width: 28px; height: 28px;
+  border-radius: 50%; background: var(--accent-soft); color: var(--accent); font: 700 14px/28px var(--sans);
+  text-align: center; }
+ol.steps > li strong:first-child { display: block; }
+.diagram { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.diagram svg { width: 100%; height: auto; display: block; }
+.diagram text { font-family: var(--sans); fill: var(--text); }
+.diagram .muted { fill: var(--muted); }
+.diagram .box { fill: var(--surface-2); stroke: var(--line); }
+.diagram .boxa { fill: var(--a-soft); stroke: var(--a); }
+.diagram .boxb { fill: var(--b-soft); stroke: var(--b); }
+.diagram .boxx { fill: var(--accent-soft); stroke: var(--accent); }
+.diagram .wire { stroke: var(--muted); fill: none; stroke-width: 1.4; }
+.log { border-left: 2px solid var(--line); padding-left: 16px; }
+.log .entry { margin-bottom: 16px; } .log time { font: 13px var(--mono); color: var(--muted); }
+.log ul { margin: 4px 0 0; padding-left: 18px; }
+dl.gloss dt { font-weight: 650; margin-top: 10px; } dl.gloss dd { margin: 2px 0 0; color: var(--muted); max-width: 70ch; }
+.status { font: 600 12px var(--mono); padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
+.status.done { background: var(--a-soft); color: var(--a); }
+.status.next { background: var(--accent-soft); color: var(--accent); }
+.status.later { background: var(--surface-2); color: var(--muted); }
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; }
+  nav { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 18px 16px; }
+  nav ol { columns: 2; }
+  main { padding: 24px 16px 60px; }
+  header.hero h1 { font-size: 27px; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav aria-label="Sections">
+  <div class="brand">Harness Field Guide</div>
+  <div class="meta">Updated 2026-11-16 · v0.4</div>
+  <ol>
+    <li><a href="#what">What this is</a></li>
+    <li><a href="#picture">The big picture</a></li>
+    <li><a href="#install">Install and init</a></li>
+    <li><a href="#pieces">The pieces</a></li>
+    <li><a href="#accounts">Accounts A and B</a></li>
+    <li><a href="#login">Log in to account B</a></li>
+    <li><a href="#loop">A working session</a></li>
+    <li><a href="#seams">Context seams</a></li>
+    <li><a href="#zipzap">Zip and Zap</a></li>
+    <li><a href="#commands">Command cheat sheet</a></li>
+    <li><a href="#files">Where things live</a></li>
+    <li><a href="#roadmap">Roadmap</a></li>
+    <li><a href="#glossary">Glossary</a></li>
+    <li><a href="#changelog">Changelog</a></li>
+  </ol>
+  <button class="theme" id="theme" type="button">Toggle theme</button>
+</nav>
+
+<main>
+<header class="hero">
+  <h1>How the harness works</h1>
+  <p>Your setup for running several Claude Code agents on one project: a supervisor that plans, workers that
+  build in parallel, and two subscription seats (A and B) sharing the load. Read a section at a time.</p>
+</header>
+
+<section id="what">
+  <h2>What this is</h2>
+  <p class="lede">The harness is everything around Claude Code that turns one chat into a small team.</p>
+  <div class="grid">
+    <div class="card"><h4>herdr</h4><p>The terminal workspace. Every agent runs in its own herdr tab, and herdr's API
+      lets one agent start, prompt and read the others.</p></div>
+    <div class="card"><h4>devkit</h4><p>Your Claude Code plugin in <code>~/dev-playbook/devkit</code>: the skills
+      (supervise, work, brief, land, handover, resume, fleet, backlog, conventions) and the context-guard hook.</p></div>
+    <div class="card"><h4>fleet</h4><p>The command that spawns, briefs, resets and lands workers. Each worker gets its
+      own git worktree, branch, test port and account.</p></div>
+    <div class="card"><h4>Accounts A / B</h4><p>Two seats from the same organization. A is your normal login; B lives in
+      its own config folder. fleet spreads workers across both.</p></div>
+  </div>
+  <p>All state lives in files (backlog, decisions, handovers, briefs, reports), never only in an agent's
+  memory. That is what lets an agent be cleared, restarted, or moved to another account and carry on.</p>
+</section>
+
+<section id="picture">
+  <h2>The big picture</h2>
+  <p class="lede">You talk to the supervisor. The supervisor talks to workers through fleet. Work lands on main only after it is verified.</p>
+  <div class="diagram" role="img" aria-label="You talk to the supervisor on account A. The supervisor spawns workers on accounts A and B, each in its own worktree. Verified work is fast-forwarded to main.">
+  <svg viewBox="0 0 820 360" xmlns="http://www.w3.org/2000/svg">
+    <rect class="box" x="20" y="150" width="110" height="56" rx="8"/>
+    <text x="75" y="183" text-anchor="middle" font-size="15" font-weight="600">You</text>
+    <path class="wire" d="M130 178 H200"/>
+    <text x="165" y="168" text-anchor="middle" font-size="12" class="muted">talk</text>
+    <rect class="boxa" x="200" y="140" width="170" height="76" rx="8"/>
+    <text x="285" y="170" text-anchor="middle" font-size="15" font-weight="600">Supervisor</text>
+    <text x="285" y="192" text-anchor="middle" font-size="12" class="muted">Opus · tab "supervisor"</text>
+    <text x="285" y="208" text-anchor="middle" font-size="12" class="muted">backlog, briefs, landing</text>
+    <path class="wire" d="M370 178 H420 V60 H470"/>
+    <path class="wire" d="M420 178 H470"/>
+    <path class="wire" d="M420 178 V296 H470"/>
+    <text x="430" y="250" font-size="12" class="muted">fleet spawn / brief</text>
+    <rect class="boxa" x="470" y="28" width="190" height="64" rx="8"/>
+    <text x="565" y="54" text-anchor="middle" font-size="14" font-weight="600">Worker one · A</text>
+    <text x="565" y="74" text-anchor="middle" font-size="12" class="muted">worktree ../repo-one</text>
+    <rect class="boxb" x="470" y="146" width="190" height="64" rx="8"/>
+    <text x="565" y="172" text-anchor="middle" font-size="14" font-weight="600">Worker two · B</text>
+    <text x="565" y="192" text-anchor="middle" font-size="12" class="muted">worktree ../repo-two</text>
+    <rect class="boxb" x="470" y="264" width="190" height="64" rx="8"/>
+    <text x="565" y="290" text-anchor="middle" font-size="14" font-weight="600">Worker three · B</text>
+    <text x="565" y="310" text-anchor="middle" font-size="12" class="muted">worktree ../repo-three</text>
+    <path class="wire" d="M660 60 H720 V178 H740"/>
+    <path class="wire" d="M660 178 H740"/>
+    <path class="wire" d="M660 296 H720 V178"/>
+    <rect class="boxx" x="740" y="150" width="66" height="56" rx="8"/>
+    <text x="773" y="183" text-anchor="middle" font-size="14" font-weight="600">main</text>
+    <text x="700" y="140" text-anchor="middle" font-size="12" class="muted">REPORT → land</text>
+  </svg>
+  </div>
+  <p>Green boxes run on account <span class="tag a">A</span>, blue on <span class="tag b">B</span>. Which worker
+  gets which account is decided at spawn time: you pick with <code>-a</code>, or fleet picks the logged-in
+  account running fewer agents.</p>
+</section>
+
+<section id="install">
+  <h2>Install and init</h2>
+  <p class="lede">devkit is a Claude Code plugin that works in any git repo, on any stack. Two commands install it, one adopts a repo.</p>
+  <h3>From GitHub (any machine)</h3>
+  <pre><code>/plugin marketplace add Codemigod-666/Harness_and_biz
+/plugin install devkit@harness
+# then, in your repo:
+devkit init</code></pre>
+  <p><code>devkit init</code> detects the stack (justfile, Makefile, package.json, go.mod, pyproject, Cargo.toml, a Frappe app),
+  proposes the check, test and gate commands, and adds <code>.devkit/config.env</code>, <code>AGENTS.md</code>, the
+  <code>docs/</code> tree (fleet roles, backlog, handovers, conventions) and a <code>.gitignore</code> line. It never
+  overwrites a file. <code>devkit doctor</code> checks the setup; <code>devkit check | test | gate</code> run what the
+  config says, so the skills never name <code>just</code>, <code>go</code> or <code>pnpm</code>.</p>
+  <h3>From a local checkout (this machine)</h3>
+  <p><code>~/dev-playbook/install.sh</code> links <code>devkit</code> and the packs into <code>~/.claude/skills</code> and the
+  commands into <code>~/.local/bin</code>, so edits in the checkout apply at once.</p>
+  <h3>Packs</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Pack</th><th>In the marketplace</th><th>What</th></tr></thead>
+    <tbody>
+      <tr><td><code>devkit</code></td><td>yes</td><td>The core: supervise, work, brief, land, handover, resume, fleet, backlog, conventions; commands <code>devkit</code>, <code>fleet</code>, <code>backlog</code>, <code>claude-acct</code>.</td></tr>
+      <tr><td><code>devkit-frappe</code></td><td>yes</td><td>Zip and Zap for the Frappe workspace: skill <code>zipzap</code>, commands <code>frappe-zip</code>, <code>frappe-zap</code>.</td></tr>
+      <tr><td><code>devkit-local</code></td><td>no</td><td>This machine only: skill <code>harness-docs</code> and this guide's server.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="pieces">
+  <h2>The pieces</h2>
+  <p class="lede">Each skill does one job. You rarely call them yourself; the supervisor and workers do.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Piece</th><th>Who uses it</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>/devkit</code></td><td>you</td><td>Adopt this repo (<code>devkit init</code>), or answer "what does the playbook say about X".</td></tr>
+      <tr><td><code>/devkit:supervise</code></td><td>supervisor</td><td>The supervisor's role: keep the backlog, write briefs, spawn and check workers, land work.</td></tr>
+      <tr><td><code>/devkit:work</code></td><td>worker</td><td>A worker's role: build only inside its lane and finish with <code>REPORT &lt;path&gt;</code>.</td></tr>
+      <tr><td><code>/devkit:brief</code></td><td>supervisor</td><td>Turn a backlog item into a brief file (goal, Done-when, lane, model).</td></tr>
+      <tr><td><code>/devkit:land</code></td><td>supervisor</td><td>Check each Done-when against the diff, rerun <code>devkit gate</code>, fast-forward main.</td></tr>
+      <tr><td><code>/devkit:handover</code> · <code>resume</code></td><td>any agent</td><td>Write and commit a handover before a context clear; pick up from it afterwards.</td></tr>
+      <tr><td><code>/devkit:backlog</code></td><td>both</td><td>Tasks, ideas, bugs, questions as one file each in <code>docs/backlog/</code>.</td></tr>
+      <tr><td><code>/devkit:conventions</code></td><td>both</td><td>Load the coding rule cards (GEN-2, GO-4, TS-17 …) before writing or reviewing code.</td></tr>
+      <tr><td><code>/devkit-local:harness-docs</code></td><td>Claude</td><td>Keep this guide current and serve it on a local port.</td></tr>
+      <tr><td>context guard</td><td>hook</td><td>Asks for a handover at 200k tokens and insists at 250k.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="accounts">
+  <h2>Accounts A and B</h2>
+  <p class="lede">Two seats from the same organization, on one machine, kept apart by one environment variable.</p>
+  <h3>How the separation works</h3>
+  <p>Claude Code keeps its login, settings and history in a config folder: <code>~/.claude</code> by default. The
+  documented variable <code>CLAUDE_CONFIG_DIR</code> points it at another folder. So:</p>
+  <ul>
+    <li><span class="tag a">A</span> is plain <code>claude</code>, with <code>CLAUDE_CONFIG_DIR</code> unset, using <code>~/.claude</code>.</li>
+    <li><span class="tag b">B</span> is <code>claude</code> with <code>CLAUDE_CONFIG_DIR=~/.claude-b</code>.</li>
+  </ul>
+  <div class="note"><strong>Never set CLAUDE_CONFIG_DIR=~/.claude for A.</strong> When the variable is set, Claude
+  Code keeps its global state inside that folder instead of <code>~/.claude.json</code>, so A would lose its
+  trusted folders and onboarding state. The tools always <em>unset</em> it for A.</div>
+  <h3>What B shares with A, and what it keeps to itself</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Item in ~/.claude-b</th><th>Shared?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>settings.json</code>, <code>settings.local.json</code></td><td>linked to A</td><td>Same permissions, hooks and auto-mode setup.</td></tr>
+      <tr><td><code>skills/</code>, <code>plugins/</code>, <code>hooks/</code></td><td>linked to A</td><td>devkit and the herdr agent-state hook work the same on both.</td></tr>
+      <tr><td><code>projects/&lt;project&gt;/memory</code></td><td>linked to A</td><td>Agents on A and B remember the same things about the project.</td></tr>
+      <tr><td><code>.credentials.json</code></td><td>B's own</td><td>B's login. Never copied or linked.</td></tr>
+      <tr><td>sessions, history, <code>.claude.json</code></td><td>B's own</td><td>Separate session history; B asks to trust each folder once.</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Scoped to the project</h3>
+  <p>B is never switched on globally. A project opts in with <code>.claude/accounts.env</code>
+  (<code>~/frappe</code> has one). <code>claude-acct a|b</code> only starts inside a herdr pane, inside such a project.
+  fleet sets the account on each worker's pane just before <code>claude</code> starts. Outside herdr, plain
+  <code>claude</code> stays on A everywhere.</p>
+  <h3>When one seat hits its limit</h3>
+  <p><code>fleet respawn &lt;name&gt; -a b</code> (or <code>-a a</code>): the worker commits a handover, exits, restarts in
+  the same worktree on the other account and resumes. Nothing is lost, because the work lives in git and files.
+  Both seats belong to one org, so an org-wide spend cap, if your admin set one, still applies to the total.</p>
+</section>
+
+<section id="login">
+  <h2>Log in to account B</h2>
+  <p class="lede">A one-time setup. About five minutes.</p>
+  <ol class="steps">
+    <li><strong>Get B's seat ready.</strong> Your org admin assigns a seat to B's email in the admin console.
+      Accept the invite email and sign in once at claude.ai as B, so the seat is active.</li>
+    <li><strong>Check B's folder exists.</strong> Already done for frappe. To repeat it:
+      <pre><code>cd ~/frappe
+claude-acct setup        # creates ~/.claude-b and the shared links; safe to rerun</code></pre></li>
+    <li><strong>Prepare the browser.</strong> Your browser is probably signed in to claude.ai as A. Open a
+      <em>private/incognito window</em> for the next step, or sign out of claude.ai first. Otherwise the browser
+      silently approves the login as A.</li>
+    <li><strong>Sign B in.</strong>
+      <pre><code>claude-acct login b --email &lt;B's email&gt;     # add --sso if your org uses SSO</code></pre>
+      It prints a URL. On WSL the browser may not open by itself: copy the URL into the private window, sign in
+      as B, choose your organization, and paste the code back into the terminal if it asks.</li>
+    <li><strong>Verify.</strong> <code>claude-acct status</code> should show B with <code>"loggedIn": true</code> and
+      <strong>B's</strong> email, and <code>fleet accounts</code> (inside a repo) should show <code>b  yes</code>.</li>
+    <li><strong>First run.</strong> In a herdr pane in <code>~/frappe</code>: <code>claude-acct b</code>. Approve the
+      "trust this folder" dialog once. The <code>/status</code> command inside Claude shows which account is active.</li>
+  </ol>
+  <div class="note"><strong>Logged in as the wrong account?</strong>
+    <code>CLAUDE_CONFIG_DIR=~/.claude-b claude auth logout</code>, then repeat steps 3–5. This only touches B; A stays logged in.</div>
+</section>
+
+<section id="loop">
+  <h2>A working session</h2>
+  <p class="lede">What happens when you say "go".</p>
+  <ol class="steps">
+    <li><strong>Open the workspace.</strong> <code>cd</code> into the repo, run <code>herdr</code>, then <code>just supervisor</code>
+      (or <code>claude</code>) in the first pane.</li>
+    <li><strong>Plan.</strong> The supervisor turns your goal into backlog items, each with a Goal and a Done-when.
+      <code>backlog ready</code> lists what can start.</li>
+    <li><strong>Spawn.</strong> <code>fleet spawn one -l "src/feature/**"</code> creates worktree <code>../repo-one</code> on
+      branch <code>fleet/one</code>, a herdr tab, a test port and an account, then starts Claude in auto mode.</li>
+    <li><strong>Brief.</strong> <code>fleet brief one .claude/fleet/briefs/T-012-one.md</code>; the worker runs
+      <code>/devkit:work</code> and stays inside its lane.</li>
+    <li><strong>Report.</strong> The worker ends with <code>REPORT &lt;path&gt;</code>. The supervisor checks Done-when against
+      the diff and reruns the gate.</li>
+    <li><strong>Land.</strong> <code>fleet land one</code> fast-forwards main. <code>fleet close one</code> removes the tab and
+      the merged worktree.</li>
+  </ol>
+</section>
+
+<section id="seams">
+  <h2>Context seams</h2>
+  <p class="lede">Long sessions don't degrade. Each agent restarts itself from a file, on purpose, before its context fills up.</p>
+  <ol class="steps">
+    <li><strong>200k tokens:</strong> the context guard asks the agent to write <code>docs/handovers/&lt;name&gt;.md</code>,
+      commit it, and say <code>HANDOVER &lt;sha&gt;</code>.</li>
+    <li><strong>250k tokens:</strong> the guard blocks the agent from stopping until the handover is done.</li>
+    <li><strong>Reset:</strong> <code>fleet reset &lt;name&gt;</code> sends <code>/clear</code>, then <code>/devkit:resume</code>.
+      The agent re-reads its handover, checks it against git, and continues.</li>
+  </ol>
+  <p>The same handover is what makes <code>respawn</code> work across models and accounts.</p>
+</section>
+
+<section id="zipzap">
+  <h2>Zip and Zap</h2>
+  <p class="lede">Type "Zip" and the Frappe workspace goes safely into git and <code>~/frappe</code> is emptied. Type "Zap" and it comes back exactly as it was.</p>
+  <h3>The idea</h3>
+  <p><code>~/frappe</code> is a git repo. Git keeps what you write: custom apps, docs, settings. The bench in
+  <code>mybench/</code> (Python env, Frappe itself, assets, logs) is about 1.2 GB that can always be rebuilt, so
+  it isn't saved; only its exact versions are, in <code>.zip/bench.lock.json</code>. Each site's data travels as
+  one encrypted file in <code>.zip/sites/</code>.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Saved by Zip</th><th>Rebuilt by Zap</th></tr></thead>
+    <tbody>
+      <tr><td>Custom apps, with history</td><td>Frappe at the same commit</td></tr>
+      <tr><td>Database, public and private files, the original <code>site_config.json</code> (encrypted)</td><td>Python environment and Node packages</td></tr>
+      <tr><td>Bench settings: ports, developer mode, app order</td><td>Built assets, Redis config, Procfile</td></tr>
+      <tr><td>Claude memory and <code>.zip/HANDOVER.md</code></td><td>Logs (not kept)</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Zip, step by step</h3>
+  <ol class="steps">
+    <li><strong>Handover.</strong> Claude writes <code>.zip/HANDOVER.md</code>: where things stand and what's next.</li>
+    <li><strong>Checks.</strong> The bench must be stopped. Every file not in git must be on the "rebuildable" list,
+      otherwise Zip stops and names the file.</li>
+    <li><strong>Lock and backup.</strong> Exact versions are recorded. Each site is backed up with its files and an exact
+      row count per table, then encrypted with the key in <code>~/.config/frappe-zip/key</code>.</li>
+    <li><strong>Push.</strong> Commit, tag <code>zip-YYYYMMDD-HHMMSS</code>, push.</li>
+    <li><strong>Prove it.</strong> A fresh clone from GitHub must match, and every backup must decrypt, match its checksum
+      and contain a valid dump. If anything fails, <em>nothing is deleted</em>.</li>
+    <li><strong>Safety copy.</strong> A git bundle and the backups go to <code>~/.cache/frappe-zip-last/</code> for 7 days.</li>
+    <li><strong>Wipe.</strong> The site databases are dropped and <code>~/frappe</code> is emptied.</li>
+  </ol>
+  <h3>Zap, step by step</h3>
+  <ol class="steps">
+    <li><strong>Clone</strong> the repo into the empty <code>~/frappe</code> and read the lock.</li>
+    <li><strong>Rebuild</strong> the bench with <code>bench init</code>, pin Frappe to the locked commit, put the custom apps back, install requirements.</li>
+    <li><strong>Restore</strong> each site from its decrypted backup, with the original <code>site_config.json</code>, so encrypted passwords still work.</li>
+    <li><strong>Prove it.</strong> Row counts must equal the Zip's counts, table by table. Then build, migrate, ping each site, and check that the git tree is clean.</li>
+    <li><strong>Resume.</strong> Memory is put back, then Claude reads the handover and carries on.</li>
+  </ol>
+  <h3>How long</h3>
+  <p>Zip took about 8 seconds in the rehearsal. Zap is estimated at 12–20 minutes the first time on a machine and 8–12
+  minutes when the pip and yarn caches are warm. Almost all of that is <code>bench init</code> and the asset build.
+  This page gets the measured numbers after the first full rehearsal.</p>
+  <div class="note"><strong>Keep the key safe.</strong> <code>~/.config/frappe-zip/key</code> decrypts every backup. Keep a copy in
+    your password manager: a new machine needs it, plus the MariaDB root password in <code>~/.config/frappe-zip/db_root</code>.</div>
+</section>
+
+<section id="commands">
+  <h2>Command cheat sheet</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>claude-acct status</code></td><td>Login state of A and B.</td></tr>
+      <tr><td><code>claude-acct login b</code></td><td>Sign B in (once).</td></tr>
+      <tr><td><code>claude-acct a</code> / <code>b</code></td><td>Start Claude on that account in this project (herdr only).</td></tr>
+      <tr><td><code>claude-acct init</code> · <code>setup</code></td><td>Opt a project in · create/repair B's folder.</td></tr>
+      <tr><td><code>fleet accounts</code></td><td>Logins and how many agents each account runs.</td></tr>
+      <tr><td><code>fleet spawn &lt;name&gt; [-m model] [-a a|b] [-l lane]</code></td><td>New worker: worktree, tab, port, account.</td></tr>
+      <tr><td><code>fleet brief &lt;name&gt; &lt;brief.md&gt;</code></td><td>Hand it a task.</td></tr>
+      <tr><td><code>fleet status</code></td><td>State, context, model, account, port, lane of every agent.</td></tr>
+      <tr><td><code>fleet read &lt;name&gt; 40</code> · <code>wait &lt;name&gt;</code></td><td>Recent output · wait until idle/done/blocked.</td></tr>
+      <tr><td><code>fleet reset &lt;name&gt;</code></td><td>Context seam: handover, clear, resume.</td></tr>
+      <tr><td><code>fleet respawn &lt;name&gt; -m opus -a b</code></td><td>Restart on another model and/or account.</td></tr>
+      <tr><td><code>fleet land &lt;name&gt;</code> · <code>close &lt;name&gt;</code></td><td>Gate + fast-forward main · clean up.</td></tr>
+      <tr><td><code>devkit init</code> · <code>doctor</code> · <code>gate</code></td><td>Adopt a repo · check the setup · run the configured gate.</td></tr>
+      <tr><td><code>harness-docs start</code></td><td>Serve this guide at <code>http://127.0.0.1:4700</code>.</td></tr>
+      <tr><td>"Zip" · <code>frappe-zip</code></td><td>Snapshot, push, verify, wipe <code>~/frappe</code>. <code>--no-wipe</code> to only snapshot.</td></tr>
+      <tr><td>"Zap" · <code>frappe-zap</code></td><td>Rebuild <code>~/frappe</code> from the last Zip. <code>--ref &lt;tag&gt;</code> for an older one.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="files">
+  <h2>Where things live</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Path</th><th>What</th></tr></thead>
+    <tbody>
+      <tr><td><code>~/dev-playbook/</code></td><td>The harness repo: PLAYBOOK.md (rules), GUIDE.md (daily use), devkit/ (core plugin), packs/ (frappe, local), template/ and stacks/ (optional starters), this guide in docs/site/.</td></tr>
+      <tr><td><code>~/.claude/skills/devkit</code> · <code>devkit-frappe</code> · <code>devkit-local</code></td><td>Links to <code>~/dev-playbook/devkit</code> and <code>packs/frappe</code>, <code>packs/local</code>; edits apply to new sessions at once.</td></tr>
+      <tr><td><code>~/dev-playbook/.claude-plugin/marketplace.json</code></td><td>The marketplace <code>harness</code>: lists devkit and devkit-frappe.</td></tr>
+      <tr><td><code>~/.local/bin/{devkit,fleet,backlog,claude-acct}</code> · <code>{frappe-zip,frappe-zap}</code> · <code>harness-docs</code></td><td>Links to <code>devkit/bin</code> and each pack's <code>bin/</code>.</td></tr>
+      <tr><td><code>~/.claude/</code> · <code>~/.claude-b/</code></td><td>Account A's config · account B's config.</td></tr>
+      <tr><td><code>&lt;project&gt;/.claude/accounts.env</code></td><td>Opts the project into A/B; sets B's folder.</td></tr>
+      <tr><td><code>&lt;project&gt;/.claude/fleet/</code></td><td>Scratch: board, briefs, reports, agent state (gitignored).</td></tr>
+      <tr><td><code>&lt;project&gt;/docs/</code></td><td>Committed memory: backlog, decisions, handovers, conventions.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="roadmap">
+  <h2>Roadmap</h2>
+  <p class="lede">What's done, what's next, and what's parked for the brainstorm.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Item</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>devkit installs from GitHub into any repo, on any stack</td><td><span class="status done">done</span></td><td>Marketplace <code>harness</code>, <code>devkit init</code>, packs; end-to-end test on node, python and shell repos.</td></tr>
+      <tr><td>Account B config folder + <code>claude-acct</code></td><td><span class="status done">done</span></td><td>Scoped per project via accounts.env.</td></tr>
+      <tr><td>fleet accounts: <code>-a</code>, auto-pick, respawn across accounts</td><td><span class="status done">done</span></td><td>Tested without a live B session.</td></tr>
+      <tr><td>Harness under git + this guide</td><td><span class="status done">done</span></td><td>Repo: Harness_and_biz.</td></tr>
+      <tr><td>Zip / Zap for the Frappe workspace</td><td><span class="status next">next</span></td><td>Built; Zip rehearsed. Zap rehearsal, then the first real run.</td></tr>
+      <tr><td>Log in B, first real two-account session</td><td><span class="status next">next</span></td><td>See <a href="#login">Log in to account B</a>.</td></tr>
+      <tr><td>Auto-switch on usage limit</td><td><span class="status later">later</span></td><td>Spot "usage limit" in a worker's output, respawn on the other account.</td></tr>
+      <tr><td>[A]/[B] in the status line</td><td><span class="status later">later</span></td><td>See the account of every tab at a glance.</td></tr>
+      <tr><td>Account policy in MODELS.md</td><td><span class="status later">later</span></td><td>For example, supervisor and Opus on A, Sonnet spread across both.</td></tr>
+      <tr><td>Frappe project setup (CLAUDE.md, gate, conventions)</td><td><span class="status later">later</span></td><td>Parked by you for now.</td></tr>
+      <tr><td>A site per worker on the bench</td><td><span class="status later">later</span></td><td>Workers otherwise share one DB, Redis and ports.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="glossary">
+  <h2>Glossary</h2>
+  <dl class="gloss">
+    <dt>Supervisor</dt><dd>The one agent you talk to. Plans, briefs, verifies and lands; doesn't build features itself.</dd>
+    <dt>Worker</dt><dd>A separate Claude Code process in its own herdr tab and git worktree, working one backlog item.</dd>
+    <dt>Lane</dt><dd>The file globs a worker may change. Lanes never overlap, so workers don't collide.</dd>
+    <dt>Brief</dt><dd>A file telling a worker its goal, Done-when, lane, what to read and which model to use.</dd>
+    <dt>Done-when</dt><dd>The checkable conditions that define "finished" for a backlog item.</dd>
+    <dt>Gate</dt><dd><code>devkit gate</code>: every check and test the project configures. Must be green before work lands.</dd>
+    <dt>Seam</dt><dd>A planned context reset: handover → clear → resume.</dd>
+    <dt>Auto mode</dt><dd>Claude Code's permission mode where a classifier approves safe actions and blocks risky ones. Never bypass mode.</dd>
+    <dt>CLAUDE_CONFIG_DIR</dt><dd>The environment variable that picks which config folder (and so which account) Claude Code uses.</dd>
+  </dl>
+</section>
+
+<section id="changelog">
+  <h2>Changelog</h2>
+  <div class="log">
+    <div class="entry"><time>2026-11-16 · v0.4</time>
+      <ul>
+        <li>devkit 0.2.0 is stack-neutral and installs from GitHub: <code>/plugin marketplace add</code>, <code>/plugin install devkit@harness</code>, then <code>devkit init</code>.</li>
+        <li>New marketplace <code>harness</code> (devkit, devkit-frappe). Zip / Zap moved to the <code>devkit-frappe</code> pack; the guide skill to the machine-local <code>devkit-local</code> pack.</li>
+        <li><code>install.sh</code> links the packs and their commands; <code>tests/e2e-stacks.sh</code> proves init, doctor, backlog and gate on three stacks.</li>
+      </ul></div>
+    <div class="entry"><time>2026-11-02 · v0.3</time>
+      <ul>
+        <li>Zip / Zap: <code>frappe-zip</code>, <code>frappe-zap</code> and the <code>/devkit-frappe:zipzap</code> skill.</li>
+        <li><code>~/frappe</code> is now a git repo; the bench is rebuilt, custom apps are tracked.</li>
+      </ul></div>
+    <div class="entry"><time>2026-11-02 · v0.2</time>
+      <ul>
+        <li>Harness put under git (<code>~/dev-playbook</code>, remote Harness_and_biz).</li>
+        <li><code>claude-acct</code> moved into devkit, works in any project with <code>.claude/accounts.env</code>, new <code>login</code> and <code>init</code> commands.</li>
+        <li>New skill <code>/devkit:harness-docs</code> and this guide, served locally.</li>
+      </ul></div>
+    <div class="entry"><time>2026-11-01 · v0.1</time>
+      <ul>
+        <li>Account B config folder <code>~/.claude-b</code> with links to A's setup and the frappe memory.</li>
+        <li>fleet: <code>-a a|b</code> on spawn and respawn, auto-pick, <code>fleet accounts</code>, account column in status.</li>
+      </ul></div>
+  </div>
+</section>
+</main>
+</div>
+<script>
+(function () {
+  var root = document.documentElement, key = "harness-guide-theme";
+  try { var saved = localStorage.getItem(key); if (saved) root.setAttribute("data-theme", saved); } catch (e) {}
+  document.getElementById("theme").addEventListener("click", function () {
+    var dark = root.getAttribute("data-theme") ? root.getAttribute("data-theme") === "dark"
+      : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = dark ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>

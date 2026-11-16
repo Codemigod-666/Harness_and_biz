@@ -1,0 +1,44 @@
+openapi: 3.1.0
+info:
+  title: __PROJECT__ API
+  version: 0.1.0
+  description: Source of truth for the API (API-1). Bump the version with every change (API-2).
+servers:
+  - url: /api
+tags:
+  - name: health
+    description: Liveness of the API server.
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: The server is up.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "4XX":
+          description: Problem details.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+components:
+  schemas:
+    Health:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }

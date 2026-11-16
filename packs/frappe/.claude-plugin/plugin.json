@@ -1,0 +1,6 @@
+{
+  "name": "devkit-frappe",
+  "description": "Frappe workspace pack for devkit: Zip and Zap the bench workspace (encrypted site backups, git snapshot, rebuild at locked versions).",
+  "version": "0.2.0",
+  "author": { "name": "Rishi Khandagle" }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "harness",
+  "description": "devkit: a stack-neutral workflow for Claude Code agent fleets, plus optional packs.",
+  "owner": { "name": "Rishi Khandagle" },
+  "plugins": [
+    {
+      "name": "devkit",
+      "source": "./devkit",
+      "description": "Backlog, briefs, agent fleet, context seams and conventions for any repo on any stack."
+    },
+    {
+      "name": "devkit-frappe",
+      "source": "./packs/frappe",
+      "description": "Frappe workspace pack: Zip and Zap the bench workspace."
+    }
+  ]
+}

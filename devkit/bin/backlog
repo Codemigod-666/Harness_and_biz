@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly ROOT="$(git rev-parse --show-toplevel)"
+readonly DIR="$ROOT/docs/backlog"
+readonly INDEX="$DIR/INDEX.md"
+readonly TYPES="task idea bug question"
+
+usage() {
+    cat <<'EOF'
+backlog — items in docs/backlog/<ID>-<slug>.md (frontmatter + body), index in docs/backlog/INDEX.md
+  new <task|idea|bug|question> <title> [-m milestone] [-d ID,ID]   create, prints the path
+  set <ID> <field> <value>                set a frontmatter field (status, milestone, deps, owner…)
+  show <ID>                               print the item
+  path <ID>                               print the item's file path
+  list [-t type] [-s status] [-m milestone]
+  ready                                   todo tasks/bugs whose deps are all done
+  promote <idea-ID>                       new task from an idea; idea becomes promoted
+  index                                   regenerate INDEX.md
+Statuses: task/bug todo|doing|blocked|done|dropped · idea idea|promoted|dropped · question open|answered|dropped
+EOF
+}
+
+die() {
+    echo "backlog: $*" >&2
+    exit 1
+}
+
+prefix_for() {
+    case "$1" in
+    task) echo T ;;
+    idea) echo I ;;
+    bug) echo B ;;
+    question) echo Q ;;
+    *) die "unknown type '$1' (one of: $TYPES)" ;;
+    esac
+}
+
+initial_status() {
+    case "$1" in
+    idea) echo idea ;;
+    question) echo open ;;
+    *) echo todo ;;
+    esac
+}
+
+item_files() {
+    find "$DIR" -maxdepth 1 -name '[TIBQ]-[0-9]*.md' 2>/dev/null | sort
+}
+
+file_for() {
+    local file
+    file="$(find "$DIR" -maxdepth 1 -name "$1-*.md" | head -1)"
+    [[ -n "$file" ]] || die "no item $1"
+    echo "$file"
+}
+
+next_id() {
+    local prefix="$1" last
+    last="$(item_files | sed -n "s|.*/$prefix-\([0-9]*\)-.*|\1|p" | sort -n | tail -1)"
+    printf '%s-%03d' "$prefix" "$((10#${last:-0} + 1))"
+}
+
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-50
+}
+
+# Frontmatter access in python3 stdlib (replaces yq). fm get|set|row|new FILE ...
+fm() {
+    python3 - "$@" <<'PY'
+import json, os, re, sys
+
+def split(text):
+    lines = text.split("\n")
+    if not lines or lines[0] != "---":
+        sys.exit("backlog: no frontmatter")
+    end = lines.index("---", 1)
+    return lines[1:end], lines[end + 1:]
+
+def val(raw):
+    raw = raw.strip()
+    if raw.startswith('"'):
+        return json.loads(raw)
+    if raw.startswith("["):
+        return [x.strip().strip("\"'") for x in raw[1:-1].split(",") if x.strip()]
+    return raw
+
+def get(head, key):
+    for line in head:
+        k, sep, v = line.partition(":")
+        if sep and k == key:
+            return val(v)
+    return ""
+
+def fmt(v):
+    if isinstance(v, list):
+        return "[" + ", ".join(v) + "]"
+    return v if re.fullmatch(r"[A-Za-z][A-Za-z0-9._/-]*", v) else json.dumps(v, ensure_ascii=False)
+
+def setkey(head, key, v):
+    out = f"{key}: {fmt(v)}"
+    for i, line in enumerate(head):
+        if line.partition(":")[0] == key and ":" in line:
+            head[i] = out
+            return
+    head.append(out)
+
+cmd, path = sys.argv[1], sys.argv[2]
+if cmd == "new":
+    id_, type_, status, title, milestone, deps, created = sys.argv[3:10]
+    head = ["id: " + id_, "title: " + json.dumps(title, ensure_ascii=False), "type: " + type_, "status: " + status,
+            "milestone: " + json.dumps(milestone, ensure_ascii=False),
+            "deps: [" + ", ".join(d for d in deps.split(",") if d) + "]", "created: " + created]
+    open(path, "w").write("---\n" + "\n".join(head) + "\n---\n\n")
+    sys.exit(0)
+head, body = split(open(path).read())
+if cmd == "get":
+    v = get(head, sys.argv[3])
+    print(",".join(v) if isinstance(v, list) else v)
+elif cmd == "row":
+    deps = get(head, "deps")
+    print("\t".join([get(head, "id"), get(head, "type"), get(head, "status"), get(head, "milestone"),
+                     ",".join(deps) if isinstance(deps, list) else deps, get(head, "title"), os.path.basename(path)]))
+elif cmd in ("set", "setlist"):
+    v = sys.argv[4]
+    if cmd == "setlist":
+        v = [d.strip() for d in v.split(",") if d.strip()]
+    setkey(head, sys.argv[3], v)
+    open(path, "w").write("---\n" + "\n".join(head) + "\n---\n" + "\n".join(body))
+PY
+}
+
+cmd_new() {
+    local type="$1" title="$2" milestone="" deps="" OPTIND=1
+    shift 2
+    while getopts "m:d:" opt; do
+        case "$opt" in
+        m) milestone="$OPTARG" ;;
+        d) deps="$OPTARG" ;;
+        *) die "bad option" ;;
+        esac
+    done
+    local id file
+    id="$(next_id "$(prefix_for "$type")")"
+    file="$DIR/$id-$(slugify "$title").md"
+    mkdir -p "$DIR"
+    write_item "$file" "$id" "$type" "$title" "$milestone" "$deps"
+    cmd_index >/dev/null
+    echo "$file"
+}
+
+write_item() {
+    fm new "$1" "$2" "$3" "$(initial_status "$3")" "$4" "$5" "$6" "$(date +%F)"
+}
+
+cmd_set() {
+    local file
+    file="$(file_for "$1")"
+    if [[ "$2" == "deps" ]]; then
+        fm setlist "$file" deps "$3"
+    else
+        fm set "$file" "$2" "$3"
+    fi
+    cmd_index >/dev/null
+}
+
+rows() {
+    local file
+    item_files | while IFS= read -r file; do
+        fm row "$file"
+    done
+}
+
+cmd_list() {
+    local type="" status="" milestone="" OPTIND=1
+    while getopts "t:s:m:" opt; do
+        case "$opt" in
+        t) type="$OPTARG" ;;
+        s) status="$OPTARG" ;;
+        m) milestone="$OPTARG" ;;
+        *) die "bad option" ;;
+        esac
+    done
+    rows | awk -F'\t' -v t="$type" -v s="$status" -v m="$milestone" \
+        '(t == "" || $2 == t) && (s == "" || $3 == s) && (m == "" || $4 == m) { printf "%-6s %-9s %-9s %-4s %s\n", $1, $2, $3, $4, $6 }'
+}
+
+cmd_ready() {
+    rows | awk -F'\t' '
+        { status[$1] = $3; type[$1] = $2; deps[$1] = $5; title[$1] = $6; order[NR] = $1 }
+        END {
+            for (i = 1; i <= NR; i++) {
+                id = order[i]
+                if ((type[id] != "task" && type[id] != "bug") || status[id] != "todo") continue
+                n = split(deps[id], d, ","); ok = 1
+                for (j = 1; j <= n; j++) if (status[d[j]] != "done") ok = 0
+                if (ok) printf "%-6s %s\n", id, title[id]
+            }
+        }'
+}
+
+cmd_promote() {
+    local idea title milestone task
+    idea="$(file_for "$1")"
+    [[ "$(fm get "$idea" type)" == "idea" ]] || die "$1 is not an idea"
+    title="$(fm get "$idea" title)"
+    milestone="$(fm get "$idea" milestone)"
+    task="$(cmd_new task "$title" -m "$milestone")"
+    fm set "$task" from "$1"
+    sed -n '/^---$/,/^---$/!p' "$idea" >>"$task"
+    cmd_set "$1" status promoted
+    echo "$task"
+}
+
+cmd_index() {
+    {
+        echo "# Backlog"
+        echo
+        echo "Generated by \`backlog index\`. Do not edit; edit the item files."
+        local type all
+        all="$(rows)"
+        for type in $TYPES; do
+            index_section "$type" <<<"$all"
+        done
+    } >"$INDEX"
+    echo "$INDEX"
+}
+
+index_section() {
+    local lines
+    lines="$(awk -F'\t' -v t="$1" '$2 == t { printf "| [%s](%s) | %s | %s | %s | %s |\n", $1, $7, $3, $4, $5, $6 }')"
+    [[ -n "$lines" ]] || return 0
+    printf '\n## %ss\n\n| id | status | milestone | deps | title |\n|----|--------|-----------|------|-------|\n' "$1"
+    echo "$lines"
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+    new) cmd_new "$@" ;;
+    set) cmd_set "$@" ;;
+    show) cat "$(file_for "$1")" ;;
+    path) file_for "$1" ;;
+    list) cmd_list "$@" ;;
+    ready) cmd_ready ;;
+    promote) cmd_promote "$@" ;;
+    index) cmd_index ;;
+    *) usage ;;
+    esac
+}
+
+main "$@"

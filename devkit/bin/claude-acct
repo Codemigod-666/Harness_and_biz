@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# claude-acct: run Claude Code on account A (default ~/.claude) or B (a second seat, own config dir) in a project.
+#   claude-acct init               create .claude/accounts.env in this project (git root, else the current dir)
+#   claude-acct setup              create/repair B's config dir: shared links to A's setup (idempotent)
+#   claude-acct login b [opts]     sign B in (opts go to `claude auth login`: --email <e>, --sso)
+#   claude-acct status             login state of A and B
+#   claude-acct a|b [claude args]  start Claude on that account (only inside herdr, inside the project)
+# The project is the nearest folder above $PWD with .claude/accounts.env. fleet reads the same file.
+set -euo pipefail
+die() { echo "claude-acct: $*" >&2; exit 1; }
+A_DIR="$HOME/.claude"
+
+find_root() {
+    local d="$PWD"
+    while [[ "$d" != / ]]; do
+        [[ -f "$d/.claude/accounts.env" ]] && { echo "$d"; return; }
+        d="$(dirname "$d")"
+    done
+    return 1
+}
+
+load_config() {
+    ROOT="$(find_root)" || die "no .claude/accounts.env above $PWD: run claude-acct init in the project"
+    ACCOUNT_B_DIR="$HOME/.claude-b"
+    SHARED_ITEMS="settings.json settings.local.json skills hooks plugins CLAUDE.md"
+    # shellcheck disable=SC1091
+    source "$ROOT/.claude/accounts.env"
+    SLUG="$(sed 's#[^A-Za-z0-9]#-#g' <<<"$ROOT")" # Claude Code's folder name for this project
+}
+
+cmd_init() {
+    local root
+    root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    [[ ! -f "$root/.claude/accounts.env" ]] || die "$root/.claude/accounts.env exists"
+    mkdir -p "$root/.claude"
+    cat >"$root/.claude/accounts.env" <<'EOF'
+# Claude accounts for this project, read by claude-acct and fleet.
+# A = default ~/.claude (CLAUDE_CONFIG_DIR stays unset). B = second seat in its own config dir.
+ACCOUNT_B_DIR="$HOME/.claude-b"
+# What B shares with A (symlinked from ~/.claude), so both run the same skills, hooks and plugins.
+SHARED_ITEMS="settings.json settings.local.json skills hooks plugins CLAUDE.md"
+EOF
+    echo "wrote $root/.claude/accounts.env; next: claude-acct setup"
+}
+
+cmd_setup() {
+    mkdir -p "$ACCOUNT_B_DIR"
+    chmod 700 "$ACCOUNT_B_DIR"
+    local item
+    for item in $SHARED_ITEMS; do
+        [[ -e "$A_DIR/$item" ]] || continue
+        if [[ -e "$ACCOUNT_B_DIR/$item" && ! -L "$ACCOUNT_B_DIR/$item" ]]; then
+            echo "skip $item: B has its own copy (remove it to share A's)"
+            continue
+        fi
+        ln -sfn "$A_DIR/$item" "$ACCOUNT_B_DIR/$item"
+        echo "linked $item"
+    done
+    # Share this project's memory, so A and B agents remember the same things.
+    mkdir -p "$A_DIR/projects/$SLUG/memory" "$ACCOUNT_B_DIR/projects/$SLUG"
+    ln -sfn "$A_DIR/projects/$SLUG/memory" "$ACCOUNT_B_DIR/projects/$SLUG/memory"
+    echo "linked projects/$SLUG/memory"
+    [[ -f "$ACCOUNT_B_DIR/.credentials.json" ]] || echo "next: claude-acct login b"
+}
+
+cmd_login() {
+    [[ "${1:-}" == b ]] || die "usage: claude-acct login b [--email <e>] [--sso]  (A is your normal claude login)"
+    shift
+    [[ -d "$ACCOUNT_B_DIR" ]] || die "B not set up: claude-acct setup"
+    echo "Signing in account B into $ACCOUNT_B_DIR."
+    echo "Use a private browser window (or sign out of claude.ai first), or the browser approves account A."
+    CLAUDE_CONFIG_DIR="$ACCOUNT_B_DIR" claude auth login --claudeai "$@"
+    cmd_status
+}
+
+cmd_status() {
+    echo "A ($A_DIR):"
+    env -u CLAUDE_CONFIG_DIR claude auth status 2>&1 | sed 's/^/  /'
+    echo "B ($ACCOUNT_B_DIR):"
+    CLAUDE_CONFIG_DIR="$ACCOUNT_B_DIR" claude auth status 2>&1 | sed 's/^/  /'
+}
+
+cmd_run() {
+    local acct="$1"
+    shift
+    [[ "${HERDR_ENV:-}" == 1 ]] || die "not inside a herdr pane; open herdr in $ROOT first"
+    if [[ "$acct" == a ]]; then
+        # A must NOT set CLAUDE_CONFIG_DIR: pointing it at ~/.claude moves global state off ~/.claude.json.
+        unset CLAUDE_CONFIG_DIR
+    else
+        [[ -f "$ACCOUNT_B_DIR/.credentials.json" ]] || die "B is not logged in: claude-acct login b"
+        export CLAUDE_CONFIG_DIR="$ACCOUNT_B_DIR"
+    fi
+    export CLAUDE_ACCOUNT="${acct^^}"
+    exec claude "$@"
+}
+
+case "${1:-}" in
+init) cmd_init ;;
+setup) load_config; cmd_setup ;;
+login) shift; load_config; cmd_login "$@" ;;
+status) load_config; cmd_status ;;
+a | A | b | B) acct="${1,,}"; shift; load_config; cmd_run "$acct" "$@" ;;
+*) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

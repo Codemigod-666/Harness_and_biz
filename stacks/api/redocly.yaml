@@ -1,0 +1,32 @@
+apis:
+  __PROJECT__@v1:
+    root: ./api/openapi/__PROJECT__.yaml
+extends:
+  - recommended-strict
+rules:
+  info-license: off          # internal API, never distributed
+  info-license-strict: off   # internal API, never distributed
+  operation-singular-tag: error
+  operation-tag-defined: error
+  tags-alphabetical: error
+  paths-kebab-case: error
+  no-http-verbs-in-paths: error
+  path-segment-plural:
+    severity: error
+    ignoreLastPathSegment: true
+  component-name-unique: error
+  spec-strict-refs: error
+  operation-4xx-problem-details-rfc7807: error
+  no-unused-components: error
+  request-mime-type:
+    severity: error
+    allowedValues: [application/json]
+  response-mime-type:
+    severity: error
+    allowedValues: [application/json, application/problem+json]
+  rule/operation-id-camel-case:
+    subject: { type: Operation, property: operationId }
+    assertions: { casing: camelCase }
+  rule/property-names-camel-case:
+    subject: { type: SchemaProperties }
+    assertions: { casing: camelCase }

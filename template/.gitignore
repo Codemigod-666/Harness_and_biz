@@ -1,0 +1,28 @@
+.DS_Store
+# client and generated data (data/source never committed)
+/data/
+# local runtime: pids, logs
+/.run/
+# secrets
+.env
+.env.*
+!.env.example
+# agent scratch
+.claude/fleet/
+.claude/conventions-audit/
+.claude/settings.local.json
+# build output
+node_modules/
+dist/
+/bin/
+*.tsbuildinfo
+test-results/
+playwright-report/
+**/shots/
+# local databases
+*.duckdb
+*.duckdb.wal
+pb_data/
+*.sqlite
+# bundles
+*.bundle

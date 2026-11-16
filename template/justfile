@@ -1,0 +1,123 @@
+set shell := ["bash", "-euc"]
+set dotenv-load := false
+
+project := "__PROJECT__"
+run_dir := ".run"
+server_main := "apps/server/cmd/server"
+server_port := "__P__20"
+server_health := "http://127.0.0.1:" + server_port + "/api/health"
+web_apps := "web"
+web_port := "__P__30"
+wait_timeout := "60"
+stop_timeout := "10"
+
+default:
+    @just --list
+
+# ── stack ────────────────────────────────────────────────────────────────────────────────────────────────
+
+# Start everything that exists yet (server, web apps); each step is idempotent and waits for health.
+up:
+    mkdir -p {{run_dir}}
+    if [ -f infra/docker-compose.yml ]; then docker compose -f infra/docker-compose.yml up -d; fi
+    if find {{server_main}} -name '*.go' 2>/dev/null | grep -q .; then just _start server "go run ./{{server_main}} serve" {{server_port}} {{server_health}}; else echo "no server yet"; fi
+    if [ -d apps/{{web_apps}} ]; then just _start {{web_apps}} "pnpm --filter {{web_apps}} dev" {{web_port}} http://127.0.0.1:{{web_port}}/; else echo "no web app yet"; fi
+    @just urls
+
+# Stop everything `up` started.
+down:
+    just _stop {{web_apps}} {{web_port}}
+    just _stop server {{server_port}}
+    if [ -f infra/docker-compose.yml ]; then docker compose -f infra/docker-compose.yml down; fi
+
+# Restart only the server and wait until it answers (safe for agents; allowlisted).
+restart:
+    just _stop server {{server_port}}
+    just _start server "go run ./{{server_main}} serve" {{server_port}} {{server_health}}
+
+# Stop everything and wipe local state. Never touches data/source.
+reset: down
+    rm -rf {{run_dir}} data/local
+    echo "reset done (data/source untouched)"
+
+# Tail every log in .run/.
+logs:
+    mkdir -p {{run_dir}} && touch {{run_dir}}/server.log && tail -f {{run_dir}}/*.log
+
+# Print the local URLs (docs/ports.md).
+urls:
+    @echo "api   http://127.0.0.1:{{server_port}}"
+    @echo "web   http://127.0.0.1:{{web_port}}"
+
+# Start a process in the background unless its port is taken; pid + log in .run/; wait for its health URL.
+_start name cmd port url:
+    mkdir -p {{run_dir}}
+    if lsof -nP -t -iTCP:{{port}} -sTCP:LISTEN > /dev/null 2>&1; then echo "{{name}} already listens on :{{port}}"; exit 0; fi
+    nohup {{cmd}} > {{run_dir}}/{{name}}.log 2>&1 & echo $! > {{run_dir}}/{{name}}.pid
+    for i in $(seq 1 {{wait_timeout}}); do \
+        if curl -sf {{url}} > /dev/null 2>&1; then echo "{{name}} on :{{port}}, log {{run_dir}}/{{name}}.log"; exit 0; fi; \
+        sleep 1; \
+    done; \
+    echo "{{name}} did not answer {{url}} in {{wait_timeout}}s; last lines of {{run_dir}}/{{name}}.log:" >&2; \
+    tail -n 30 {{run_dir}}/{{name}}.log >&2; exit 1
+
+# Stop a process from its pid file and whatever still listens on its port (SIGKILL after the timeout).
+_stop name port:
+    if [ -f {{run_dir}}/{{name}}.pid ]; then kill "$(cat {{run_dir}}/{{name}}.pid)" 2>/dev/null || true; rm -f {{run_dir}}/{{name}}.pid; fi
+    for pid in $(lsof -nP -t -iTCP:{{port}} -sTCP:LISTEN 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
+    for i in $(seq 1 {{stop_timeout}}); do \
+        if ! lsof -nP -t -iTCP:{{port}} -sTCP:LISTEN > /dev/null 2>&1; then echo "{{name}} stopped"; exit 0; fi; sleep 1; \
+    done; \
+    for pid in $(lsof -nP -t -iTCP:{{port}} -sTCP:LISTEN 2>/dev/null); do kill -9 "$pid" 2>/dev/null || true; done; \
+    echo "{{name}} did not stop in {{stop_timeout}}s; sent SIGKILL"
+
+# ── quality ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Lint + format check + types, for whatever exists. Fast; run often.
+check:
+    if [ -f go.work ] || [ -f go.mod ]; then golangci-lint run ./... ; fi
+    if [ -f package.json ]; then pnpm check && pnpm -r --if-present typecheck; fi
+    if [ -f redocly.yaml ] && ls api/openapi/*.yaml > /dev/null 2>&1; then pnpm lint:api; fi
+    if [ -x tools/lint/jsx-function-lines.sh ] && ls apps/*/src > /dev/null 2>&1; then tools/lint/jsx-function-lines.sh; fi
+    echo "check: ok"
+
+# Unit + integration tests.
+test:
+    if [ -f go.work ] || [ -f go.mod ]; then go test -timeout 600s ./...; fi
+    if [ -f package.json ]; then pnpm -r --if-present test; fi
+    echo "test: ok"
+
+# E2E against the fake adapter on this agent's port ($FLEET_PORT, default __P__91).
+e2e:
+    if [ -f package.json ]; then FLEET_PORT="${FLEET_PORT:-__P__91}" pnpm -r --if-present test:e2e; fi
+
+# E2E against the running stack (one run at a time).
+e2e-live:
+    if [ -f package.json ]; then pnpm -r --if-present test:e2e-live; fi
+
+# Everything a change must pass before it lands.
+gate: check test e2e
+    @echo "gate: green"
+
+# ── agents (herdr) ───────────────────────────────────────────────────────────────────────────────────────
+
+# Start the supervisor in this herdr pane (Opus, auto mode). Workers are spawned by it with `fleet spawn`.
+supervisor:
+    test "${HERDR_ENV:-}" = 1 || { echo "run inside herdr" >&2; exit 1; }
+    claude --permission-mode auto --model opus --effort high --autocompact 300000 --name {{project}}-supervisor \
+        "/devkit:supervise"
+
+# Fleet overview: agents, state, context tokens, model, lane.
+fleet:
+    fleet status
+
+# Ready backlog items.
+ready:
+    backlog ready
+
+# ── sharing ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# Bundle the whole repo for sharing without a remote (check for secrets first).
+bundle:
+    git bundle create "../{{project}}-$(date +%F)-$(git rev-parse --short HEAD).bundle" --all
+    git bundle verify "../{{project}}-$(date +%F)-$(git rev-parse --short HEAD).bundle"

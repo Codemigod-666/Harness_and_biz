@@ -1,0 +1,6 @@
+{
+  "name": "devkit",
+  "description": "Workflow for building with Claude Code and herdr on any stack: supervisor and worker agents, backlog, briefs, context seams (handover, clear, resume), model policy and conventions.",
+  "version": "0.2.0",
+  "author": { "name": "Rishi Khandagle" }
+}

@@ -1,0 +1,43 @@
+{
+    "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+    "files": {
+        "includes": ["apps/**", "packages/**", "!**/dist", "!**/node_modules", "!**/*.d.ts", "!**/*.gen.ts"]
+    },
+    "formatter": { "indentStyle": "space", "indentWidth": 4, "lineWidth": 120 },
+    "linter": {
+        "rules": {
+            "preset": "recommended",
+            "complexity": {
+                "noExcessiveCognitiveComplexity": { "level": "error", "options": { "maxAllowedComplexity": 10 } },
+                "noExcessiveLinesPerFunction": { "level": "error", "options": { "maxLines": 40, "skipBlankLines": true } },
+                "useMaxParams": { "level": "error", "options": { "max": 4 } }
+            },
+            "style": {
+                "noExcessiveLinesPerFile": { "level": "error", "options": { "maxLines": 300, "skipBlankLines": true } },
+                "noNonNullAssertion": "error",
+                "noDefaultExport": "error"
+            },
+            "suspicious": { "noExplicitAny": "error" }
+        }
+    },
+    "overrides": [
+        {
+            "includes": ["**/vite.config.ts", "**/playwright*.config.ts", "**/*.d.ts"],
+            "linter": { "rules": { "style": { "noDefaultExport": "off" } } }
+        },
+        {
+            "includes": ["apps/**"],
+            "linter": {
+                "rules": {
+                    "style": {
+                        "noRestrictedImports": {
+                            "level": "error",
+                            "options": { "paths": { "openapi-fetch": "Use the generated API client port (TS-7)." } }
+                        }
+                    }
+                }
+            }
+        }
+    ],
+    "css": { "parser": { "tailwindDirectives": true } }
+}

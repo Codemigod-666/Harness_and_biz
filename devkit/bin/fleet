@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# fleet: run supervisor + worker Claude Code agents in herdr tabs. Each worker is its own `claude` process in
+# auto mode, in its own git worktree and branch (fleet/<name>), with its own test port. Wraps the herdr CLI;
+# needs herdr (inside a herdr pane), git, python3. Scratch state lives in <main repo>/.claude/fleet/ (gitignored).
+set -euo pipefail
+
+COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+    echo "fleet: run inside the project's git repo" >&2
+    exit 1
+}
+readonly MAIN="$(dirname "$COMMON")"
+readonly HOME_DIR="$MAIN/.claude/fleet"
+readonly AGENTS_DIR="$HOME_DIR/agents"
+readonly PROJECT="$(basename "$MAIN" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | cut -c1-16)"
+readonly AUTOCOMPACT="${FLEET_AUTOCOMPACT:-300000}"   # backstop only; the context guard seams at 200k/250k
+# project config (.devkit/config.env): DEVKIT_PORT_BASE, DEVKIT_MAIN; FLEET_PORT_BASE overrides the port base
+# (read as data, never sourced: the file is repo-controlled)
+cfg_value() { sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$MAIN/.devkit/config.env" 2>/dev/null | head -1 || true; }
+_port="$(cfg_value DEVKIT_PORT_BASE)"
+_main="$(cfg_value DEVKIT_MAIN)"
+[[ "$_port" =~ ^[0-9]+$ ]] || _port=4790
+git check-ref-format --branch "${_main:-main}" >/dev/null 2>&1 || _main=main
+readonly PORT_BASE="${FLEET_PORT_BASE:-$_port}"
+readonly MAIN_BRANCH="${_main:-main}"
+readonly PLUGIN_ROOT="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+# Accounts: a = default config (~/.claude, CLAUDE_CONFIG_DIR unset); b = a second subscription in its own config
+# dir. Override per project with ACCOUNT_B_DIR in <main repo>/.claude/accounts.env, or FLEET_ACCOUNT_B_DIR.
+ACCOUNT_B_DIR="${FLEET_ACCOUNT_B_DIR:-$HOME/.claude-b}"
+# shellcheck disable=SC1091
+[[ -f "$MAIN/.claude/accounts.env" ]] && source "$MAIN/.claude/accounts.env"
+readonly ACCOUNT_B_DIR
+
+usage() {
+    cat <<'EOF'
+fleet: supervisor/worker agents on herdr (every worker = its own Claude Code process, auto mode)
+  init                                  create .claude/fleet/{briefs,reports,notes,agents,context}
+  adopt [name]                          register the calling agent (default: supervisor) for status/reset
+  spawn <name> [-m sonnet|opus|haiku] [-e low|medium|high|xhigh|max] [-a a|b] [-l "<lane globs>"] [--here] [--split]
+                                        worktree ../<repo>-<name> on branch fleet/<name> (--here: main tree),
+                                        new herdr tab (--split: a pane right of the caller; later split workers
+                                        stack below the last one), `claude --permission-mode auto` in it. Default model: sonnet;
+                                        default account: whichever logged-in account runs fewer agents
+  brief <name> <brief.md>               send a brief (absolute path) and start the work
+  say <name> <text…>                    send a message
+  wait <name> [timeout-ms]              wait until idle/done/blocked (prints the state)
+  read <name> [lines]                   print the agent's recent output (default 80)
+  status                                agents, state, context tokens, model, account, lane
+  reset <name> [--detach]               context seam: make sure the handover is committed, /clear, resume
+                                        (--detach: run in the background, for resetting yourself)
+  respawn <name> [-m <model>] [-e lvl] [-a a|b]
+                                        handover, exit, restart the same worktree on another model/account, resume
+  accounts                              login state of accounts a and b and how many agents each runs
+  land <name> [--no-gate]               run `devkit gate` in the worktree, fast-forward main to fleet/<name>
+  close <name>                          exit the agent, close its tab, remove the worktree if clean and merged
+  notify <title> [body]                 herdr notification to the user
+EOF
+}
+
+die() { echo "fleet: $*" >&2; exit 1; }
+# json <dotted.path>: read one value from JSON on stdin ("" when missing).
+json() { python3 -c 'import json,sys
+v=json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    v=v.get(k) if isinstance(v,dict) else None
+print("" if v is None else v)' "$1"; }
+
+require_herdr() {
+    [[ "${HERDR_ENV:-}" == 1 ]] || die "not inside a herdr pane (HERDR_ENV != 1); start herdr first"
+}
+
+agent_id() { echo "$PROJECT-$1" | cut -c1-32; }
+state_file() { echo "$AGENTS_DIR/$1.env"; }
+load() {
+    [[ -f "$(state_file "$1")" ]] || die "no fleet agent '$1' (fleet status)"
+    # shellcheck disable=SC1090
+    source "$(state_file "$1")"
+}
+
+cmd_init() {
+    mkdir -p "$HOME_DIR"/{briefs,reports,notes,agents,context}
+    if [[ ! -f "$HOME_DIR/board.md" ]]; then
+        local tpl="$MAIN/docs/fleet/templates/board.md"
+        [[ -f "$tpl" ]] || tpl="$PLUGIN_ROOT/templates/core/docs/fleet/templates/board.md"
+        [[ -f "$tpl" ]] && cp "$tpl" "$HOME_DIR/board.md" || : > "$HOME_DIR/board.md"
+    fi
+    echo "$HOME_DIR"
+}
+
+next_port() {
+    local used n
+    used="$(cat "$AGENTS_DIR"/*.env 2>/dev/null | sed -n 's/^PORT=//p' | sort -n)"
+    for n in $(seq 1 9); do
+        grep -qx "$((PORT_BASE + n))" <<<"$used" || { echo "$((PORT_BASE + n))"; return; }
+    done
+    die "no free test port in $PORT_BASE+1..9: close a worker first"
+}
+
+make_worktree() {
+    local name="$1" dir="$(dirname "$MAIN")/$(basename "$MAIN")-$1"
+    if [[ ! -d "$dir" ]]; then
+        git -C "$MAIN" worktree add -q -b "fleet/$name" "$dir" HEAD 2>/dev/null ||
+            git -C "$MAIN" worktree add -q "$dir" "fleet/$name"
+    fi
+    echo "$dir"
+}
+
+account_dir() { [[ "$1" == b ]] && echo "$ACCOUNT_B_DIR" || echo "$HOME/.claude"; }
+logged_in() { [[ -f "$(account_dir "$1")/.credentials.json" ]]; }
+account_load() { # agents on account $1; state files from before accounts existed count as a
+    local f n=0 acct
+    for f in "$AGENTS_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        acct="$(sed -n 's/^ACCOUNT=//p' "$f")"
+        [[ "${acct:-a}" == "$1" ]] && n=$((n + 1))
+    done
+    echo "$n"
+}
+check_account() {
+    [[ "$1" =~ ^[ab]$ ]] || die "account must be a or b"
+    logged_in "$1" || die "account $1 is not logged in ($(account_dir "$1")): see fleet accounts"
+}
+pick_account() { # the logged-in account with fewer agents; a on a tie
+    logged_in b || { echo a; return; }
+    logged_in a || { echo b; return; }
+    [[ "$(account_load b)" -lt "$(account_load a)" ]] && echo b || echo a
+}
+current_account() { [[ -n "${CLAUDE_CONFIG_DIR:-}" && "$CLAUDE_CONFIG_DIR" -ef "$ACCOUNT_B_DIR" ]] && echo b || echo a; }
+
+set_pane_account() { # <pane> <account>: point the pane's shell at the account before claude starts in it
+    # a must leave CLAUDE_CONFIG_DIR unset: setting it to ~/.claude would move global state off ~/.claude.json
+    if [[ "$2" == b ]]; then
+        herdr pane run "$1" " export CLAUDE_CONFIG_DIR=$(printf %q "$ACCOUNT_B_DIR")" >/dev/null
+    else
+        herdr pane run "$1" " unset CLAUDE_CONFIG_DIR" >/dev/null
+    fi
+    sleep 0.5
+}
+
+cmd_accounts() {
+    local a dir
+    printf '%-4s %-9s %-7s %s\n' acct login agents dir
+    for a in a b; do
+        dir="$(account_dir "$a")"
+        printf '%-4s %-9s %-7s %s\n' "$a" "$(logged_in "$a" && echo yes || echo no)" "$(account_load "$a")" "$dir"
+    done
+    logged_in b || echo "log b in once: CLAUDE_CONFIG_DIR=$ACCOUNT_B_DIR claude, then /login"
+}
+
+start_claude() { # <agent-id> <pane> <model> <effort>
+    # --add-dir: briefs and reports live in the main repo's .claude/fleet, outside a worker's worktree
+    local args=(-- --permission-mode auto --name "$1" --model "$3" --autocompact "$AUTOCOMPACT" --add-dir "$HOME_DIR")
+    [[ -n "$4" ]] && args+=(--effort "$4")
+    if ! herdr agent start "$1" --kind claude --pane "$2" --timeout 60000 "${args[@]}" >/dev/null; then
+        echo "fleet: $1 started but is not ready (likely the folder-trust dialog). Approve it in its tab, then continue." >&2
+        herdr notification show "fleet: $1 needs you" --body "approve the dialog in its tab" --sound request >/dev/null || true
+    fi
+}
+
+cmd_spawn() {
+    require_herdr
+    local name="$1" model=sonnet effort="" lane="" here=0 split=0 account=""
+    shift
+    [[ "$name" =~ ^[a-z][a-z0-9-]{0,14}$ ]] || die "name must match [a-z][a-z0-9-]{0,14}"
+    [[ ! -f "$(state_file "$name")" ]] || die "$name exists (fleet status / fleet close $name)"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        -m) model="$2"; shift 2 ;;
+        -e) effort="$2"; shift 2 ;;
+        -a) account="$2"; shift 2 ;;
+        -l) lane="$2"; shift 2 ;;
+        --here) here=1; shift ;;
+        --split) split=1; shift ;;
+        *) die "unknown option $1" ;;
+        esac
+    done
+    cmd_init >/dev/null
+    [[ -n "$account" ]] || account="$(pick_account)"
+    check_account "$account"
+    local cwd port id created tab pane
+    if [[ $here == 1 ]]; then cwd="$MAIN"; else cwd="$(make_worktree "$name")"; fi
+    port="$(next_port)"
+    id="$(agent_id "$name")"
+    local envs=(--env "FLEET_AGENT=$name" --env "FLEET_HOME=$HOME_DIR" --env "FLEET_PORT=$port" --env "FLEET_ACCOUNT=$account")
+    if [[ $split == 1 ]]; then
+        # first split worker goes right of the caller; the next ones stack below the newest split worker
+        local target="$HERDR_PANE_ID" direction=right f
+        while IFS= read -r f; do
+            if grep -q '^SPLIT=1$' "$f"; then
+                target="$(sed -n 's/^PANE=//p' "$f")"; direction=down; break
+            fi
+        done < <(ls -t "$AGENTS_DIR"/*.env 2>/dev/null)
+        created="$(herdr pane split --pane "$target" --direction "$direction" --cwd "$cwd" --no-focus "${envs[@]}")"
+        pane="$(json result.pane.pane_id <<<"$created")"
+        tab="$(json result.pane.tab_id <<<"$created")"
+    else
+        created="$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$cwd" --label "$name" --no-focus "${envs[@]}")"
+        tab="$(json result.tab.tab_id <<<"$created")"
+        pane="$(json result.root_pane.pane_id <<<"$created")"
+    fi
+    sleep 1 # let the shell reach its prompt
+    set_pane_account "$pane" "$account"
+    start_claude "$id" "$pane" "$model" "$effort"
+    cat >"$(state_file "$name")" <<EOF
+NAME=$name
+ID=$id
+TAB=$tab
+PANE=$pane
+SPLIT=$split
+CWD=$(printf %q "$cwd")
+BRANCH=$([[ $here == 1 ]] && echo "" || echo "fleet/$name")
+PORT=$port
+MODEL=$model
+EFFORT=$effort
+ACCOUNT=$account
+LANE="$lane"
+EOF
+    echo "$name: $id in $tab ($pane), $model, account $account, cwd $cwd, port $port"
+}
+
+cmd_adopt() { # register the calling pane's agent (the supervisor) so reset/status work on it
+    require_herdr
+    local name="${1:-supervisor}"
+    cmd_init >/dev/null
+    herdr agent rename "$HERDR_PANE_ID" "$(agent_id "$name")" >/dev/null
+    cat >"$(state_file "$name")" <<EOF
+NAME=$name
+ID=$(agent_id "$name")
+TAB=$HERDR_TAB_ID
+PANE=$HERDR_PANE_ID
+CWD=$(printf %q "$MAIN")
+BRANCH=
+PORT=$PORT_BASE
+MODEL=${FLEET_MODEL:-opus}
+EFFORT=
+ACCOUNT=$(current_account)
+LANE="supervisor: backlog, docs/decisions.md, board"
+EOF
+    echo "$name: adopted $HERDR_PANE_ID as $(agent_id "$name")"
+}
+
+cmd_brief() {
+    load "$1"
+    local brief
+    brief="$(realpath "$2")"
+    [[ -f "$brief" ]] || die "no brief $2"
+    herdr agent prompt "$ID" "/devkit:work $NAME $brief" >/dev/null
+    echo "$NAME: brief sent"
+}
+
+cmd_say() {
+    load "$1"
+    shift
+    herdr agent prompt "$ID" "$*" >/dev/null
+}
+
+agent_status() { herdr agent get "$ID" | json result.agent.agent_status; }
+
+cmd_wait() {
+    load "$1"
+    local i
+    # a prompt sent a moment ago may not have started yet: give it up to 20 s to leave idle before waiting
+    for i in $(seq 1 20); do
+        [[ "$(agent_status)" =~ ^(working|blocked)$ ]] && break
+        sleep 1
+    done
+    herdr agent wait "$ID" --timeout "${2:-3600000}" >/dev/null || true
+    agent_status
+}
+
+cmd_read() {
+    load "$1"
+    herdr agent read "$ID" --source recent-unwrapped --lines "${2:-80}"
+}
+
+cmd_status() {
+    local live f
+    live="$(herdr agent list 2>/dev/null || echo '{}')"
+    printf '%-10s %-9s %-8s %-7s %-4s %-6s %s\n' name state context model acct port lane
+    for f in "$AGENTS_DIR"/*.env; do
+        [[ -f "$f" ]] || continue
+        (
+            # shellcheck disable=SC1090
+            source "$f"
+            local state tokens
+            state="$(PANE="$PANE" python3 -c 'import json,os,sys
+agents=json.load(sys.stdin).get("result",{}).get("agents",[])
+print(next((a["agent_status"] for a in agents if a.get("pane_id")==os.environ["PANE"]),"gone"))' <<<"$live")"
+            tokens="$(json tokens 2>/dev/null <"$CWD/.claude/fleet/context/$NAME.json" || true)"
+            printf '%-10s %-9s %-8s %-7s %-4s %-6s %s\n' "$NAME" "$state" "${tokens:+$((tokens / 1000))k}" "$MODEL" \
+                "${ACCOUNT:-a}" "$PORT" "$LANE"
+        )
+    done
+}
+
+handover_committed() { # the handover is in git history and the agent's last output says HANDOVER <sha>
+    git -C "$CWD" log -1 --format=%H -- "docs/handovers/$NAME.md" | grep -q . &&
+        cmd_read "$NAME" 30 | grep -q 'HANDOVER [0-9a-f]\{7,\}'
+}
+
+ensure_handover() {
+    herdr agent wait "$ID" --timeout 3600000 >/dev/null
+    if ! handover_committed; then
+        herdr agent prompt "$ID" "/devkit:handover $NAME" --wait --timeout 900000 >/dev/null
+        handover_committed || die "$NAME did not commit a handover; read it (fleet read $NAME) and decide"
+    fi
+}
+
+resume_text() { echo "/devkit:resume $NAME"; }
+
+do_reset() {
+    ensure_handover
+    herdr agent prompt "$ID" "/clear" >/dev/null
+    sleep 3
+    herdr agent wait "$ID" --timeout 60000 >/dev/null || true
+    herdr agent prompt "$ID" "$(resume_text)" >/dev/null
+    echo "$NAME: reset and resumed from docs/handovers/$NAME.md"
+}
+
+cmd_reset() {
+    load "$1"
+    if [[ "${2:-}" == --detach ]]; then
+        nohup "$0" reset "$1" >"$HOME_DIR/notes/reset-$1.log" 2>&1 &
+        echo "$NAME: reset runs once this turn ends (log $HOME_DIR/notes/reset-$1.log)"
+        return
+    fi
+    do_reset
+}
+
+cmd_respawn() {
+    load "$1"
+    shift
+    ACCOUNT="${ACCOUNT:-a}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        -m) MODEL="$2"; shift 2 ;;
+        -e) EFFORT="$2"; shift 2 ;;
+        -a) ACCOUNT="$2"; shift 2 ;;
+        *) die "unknown option $1" ;;
+        esac
+    done
+    check_account "$ACCOUNT"
+    ensure_handover
+    herdr agent prompt "$ID" "/exit" >/dev/null
+    sleep 3
+    set_pane_account "$PANE" "$ACCOUNT"
+    start_claude "$ID" "$PANE" "$MODEL" "$EFFORT"
+    local f
+    f="$(state_file "$NAME")"
+    grep -q '^ACCOUNT=' "$f" || echo "ACCOUNT=" >>"$f"
+    sed -i -E "s/^MODEL=.*/MODEL=$MODEL/; s/^EFFORT=.*/EFFORT=$EFFORT/; s/^ACCOUNT=.*/ACCOUNT=$ACCOUNT/" "$f"
+    herdr agent prompt "$ID" "$(resume_text)" >/dev/null
+    echo "$NAME: respawned on $MODEL, account $ACCOUNT, and resumed"
+}
+
+cmd_land() {
+    load "$1"
+    [[ -n "$BRANCH" ]] || die "$NAME works in the main tree; nothing to land"
+    [[ -z "$(git -C "$CWD" status --porcelain)" ]] || die "$NAME has uncommitted changes in $CWD"
+    if [[ "${2:-}" != --no-gate ]]; then (cd "$CWD" && "$PLUGIN_ROOT/bin/devkit" gate) || die "gate failed in $CWD"; fi
+    [[ "$(git -C "$MAIN" rev-parse --abbrev-ref HEAD)" == "$MAIN_BRANCH" ]] || die "$MAIN is not on $MAIN_BRANCH"
+    git -C "$MAIN" merge --ff-only "$BRANCH" || die "not a fast-forward: ask $NAME to rebase on main"
+    echo "$NAME: main now at $(git -C "$MAIN" rev-parse --short HEAD)"
+}
+
+cmd_close() {
+    load "$1"
+    [[ "$PANE" != "${HERDR_PANE_ID:-}" ]] || die "refusing to close the calling agent"
+    herdr agent prompt "$ID" "/exit" >/dev/null 2>&1 || true
+    sleep 2
+    if [[ "${SPLIT:-0}" == 1 ]]; then
+        herdr pane close "$PANE" >/dev/null 2>&1 || true # the tab is shared with the supervisor
+    else
+        herdr tab close "$TAB" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$BRANCH" ]]; then
+        if [[ -z "$(git -C "$CWD" status --porcelain)" ]] && git -C "$MAIN" merge-base --is-ancestor "$BRANCH" "$MAIN_BRANCH"; then
+            git -C "$MAIN" worktree remove "$CWD" && git -C "$MAIN" branch -d "$BRANCH" >/dev/null
+        else
+            echo "fleet: kept $CWD (uncommitted or unmerged work on $BRANCH)" >&2
+        fi
+    fi
+    rm -f "$(state_file "$NAME")"
+    echo "$NAME: closed"
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+    init) cmd_init ;;
+    adopt) cmd_adopt "$@" ;;
+    spawn) cmd_spawn "$@" ;;
+    brief) cmd_brief "$@" ;;
+    say) cmd_say "$@" ;;
+    wait) cmd_wait "$@" ;;
+    read) cmd_read "$@" ;;
+    status) cmd_status ;;
+    accounts) cmd_accounts ;;
+    reset) cmd_reset "$@" ;;
+    respawn) cmd_respawn "$@" ;;
+    land) cmd_land "$@" ;;
+    close) cmd_close "$@" ;;
+    notify) herdr notification show "$1" --body "${2:-}" --sound done >/dev/null ;;
+    *) usage ;;
+    esac
+}
+
+main "$@"

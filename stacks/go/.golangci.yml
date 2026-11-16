@@ -1,0 +1,68 @@
+# golangci-lint v2. Rule IDs (GO-n) are in docs/conventions/go.md. Paths resolve from the git root so the
+# cmd/ and config carve-outs match wherever lint runs from.
+version: "2"
+run:
+  relative-path-mode: gitroot
+linters:
+  default: standard
+  enable: [gocyclo, gocognit, nestif, funlen, revive, errorlint, wrapcheck, err113, errname, nilerr, nilnil,
+    contextcheck, containedctx, noctx, fatcontext, forbidigo, gochecknoglobals, gochecknoinits, ireturn, iface,
+    interfacebloat, sloglint, depguard, usetesting, thelper, tparallel, paralleltest, modernize, intrange,
+    copyloopvar, exptostd, usestdlibvars, bodyclose, rowserrcheck, sqlclosecheck, exhaustive, nolintlint, gosec]
+  settings:
+    errcheck: { check-blank: true, check-type-assertions: true }
+    gocyclo: { min-complexity: 10 }
+    gocognit: { min-complexity: 10 }
+    nestif: { min-complexity: 3 }
+    funlen: { lines: 40, statements: -1 }
+    revive:
+      rules:
+        - { name: argument-limit, arguments: [4] }
+        - { name: file-length-limit, arguments: [{ max: 300, skipComments: true, skipBlankLines: true }] }
+        - { name: context-as-argument }
+        - { name: context-keys-type }
+        - { name: error-strings }
+        - { name: error-naming }
+        - { name: error-return }
+        - { name: errorf }
+        - { name: receiver-naming }
+        - { name: var-naming }
+        - { name: unexported-return }
+        - { name: use-any }
+        - { name: early-return }
+    sloglint: { no-global: all, context: scope, static-msg: true, no-mixed-args: true, key-naming-case: snake }
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - { pattern: ^os\.(Getenv|LookupEnv|Exit)$, msg: "config is read in main/config (GO-4)" }
+        - { pattern: ^context\.(Background|TODO)$, msg: "take ctx from the caller (GO-9)" }
+        - { pattern: ^(fmt\.Print.*|print|println|log\.(Print|Fatal|Panic).*)$, msg: "use *slog.Logger (GO-17)" }
+        - { pattern: ^time\.Sleep$, msg: "wait on ctx; tests use testing/synctest (GO-22)" }
+        - { pattern: ^reflect\.DeepEqual$, msg: "use go-cmp in tests (GO-20)" }
+    depguard:
+      rules:
+        main:
+          deny:
+            - { pkg: github.com/stretchr/testify, desc: "GO-20" }
+            - { pkg: go.uber.org/mock, desc: "GO-23" }
+            - { pkg: github.com/golang/mock, desc: "GO-23" }
+            - { pkg: io/ioutil, desc: "GO-19" }
+            - { pkg: math/rand$, desc: "GO-19" }
+            - { pkg: github.com/pkg/errors, desc: "GO-6" }
+            - { pkg: github.com/sirupsen/logrus, desc: "GO-17" }
+            - { pkg: go.uber.org/zap, desc: "GO-17" }
+    exhaustive: { default-signifies-exhaustive: true }
+    nolintlint: { require-explanation: true, require-specific: true }
+    iface: { enable: [identical, unused, opaque] }
+    interfacebloat: { max: 5 }
+    ireturn: { allow: [error, stdlib, empty] }
+  exclusions:
+    generated: strict
+    rules:
+      - { path: _test\.go, linters: [funlen, wrapcheck, err113, gochecknoglobals] }
+      - { path: (^|/)(cmd|internal/config)/, linters: [forbidigo] }
+formatters:
+  enable: [gofumpt, goimports, golines]
+  settings:
+    goimports: { local-prefixes: [__MODULE__] }
+    golines: { max-len: 120 }
